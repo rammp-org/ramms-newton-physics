@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "RammsNewtonPhysics",
+	"Description": "Experimental RAMMS plugin for integrating Newton Dynamics as an external robotics physics backend for selected Unreal actors and components.",
+	"Category": "Robotics & Simulation",
+	"CreatedBy": "RAMMP",
+	"CreatedByURL": "https://github.com/rammp-org",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "RammsNewtonPhysics",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
