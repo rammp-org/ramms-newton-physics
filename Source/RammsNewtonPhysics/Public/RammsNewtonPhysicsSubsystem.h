@@ -15,11 +15,11 @@ class RAMMSNEWTONPHYSICS_API URammsNewtonPhysicsSubsystem : public UTickableWorl
 	GENERATED_BODY()
 
 public:
-	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
-	virtual void Deinitialize() override;
-	virtual void Tick(float DeltaTime) override;
+	virtual void	Initialize(FSubsystemCollectionBase& Collection) override;
+	virtual void	Deinitialize() override;
+	virtual void	Tick(float DeltaTime) override;
 	virtual TStatId GetStatId() const override;
-	virtual bool IsTickable() const override { return true; }
+	virtual bool	IsTickable() const override { return true; }
 
 	void RegisterBridge(URammsNewtonPhysicsComponent* Bridge);
 	void UnregisterBridge(URammsNewtonPhysicsComponent* Bridge);
@@ -34,7 +34,7 @@ private:
 	void StepSimulation(float FixedStepSeconds);
 
 	TArray<TWeakObjectPtr<URammsNewtonPhysicsComponent>> RegisteredBridges;
-	float AccumulatedTimeSeconds = 0.0f;
-	int64 StepCounter = 0;
-	bool bLoggedUnavailable = false;
+	float												 AccumulatedTimeSeconds = 0.0f;
+	int64												 StepCounter = 0;
+	bool												 bLoggedUnavailable = false;
 };

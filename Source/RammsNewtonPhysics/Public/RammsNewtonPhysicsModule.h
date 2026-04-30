@@ -22,7 +22,7 @@ public:
 	virtual void ShutdownModule() override;
 
 	FRammsNewtonBackendStatus GetBackendStatus() const;
-	bool IsBackendReady() const;
+	bool					  IsBackendReady() const;
 
 private:
 	void RefreshBackendStatus();

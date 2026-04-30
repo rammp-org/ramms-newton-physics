@@ -56,7 +56,7 @@ void URammsNewtonPhysicsSubsystem::Tick(float DeltaTime)
 		: (1.0f / 60.0f);
 
 	AccumulatedTimeSeconds += DeltaTime;
-	int32 Substeps = 0;
+	int32		Substeps = 0;
 	const int32 MaxSubsteps = FMath::Max(1, Settings->MaxSubstepsPerTick);
 	while (AccumulatedTimeSeconds >= FixedStepSeconds && Substeps < MaxSubsteps)
 	{

@@ -8,8 +8,8 @@
 UENUM(BlueprintType)
 enum class ERammsNewtonBackendMode : uint8
 {
-	StubOnly UMETA(DisplayName = "Stub Only"),
-	HeadersOnly UMETA(DisplayName = "Headers Detected"),
+	StubOnly		UMETA(DisplayName = "Stub Only"),
+	HeadersOnly		UMETA(DisplayName = "Headers Detected"),
 	PrebuiltLibrary UMETA(DisplayName = "Prebuilt Library Linked"),
 };
 
@@ -17,9 +17,9 @@ UENUM(BlueprintType)
 enum class ERammsNewtonSimulationRole : uint8
 {
 	GenericRigidBody UMETA(DisplayName = "Generic Rigid Body"),
-	MobilityBase UMETA(DisplayName = "Mobility Base"),
-	Manipulator UMETA(DisplayName = "Manipulator"),
-	HybridRobot UMETA(DisplayName = "Hybrid Robot"),
+	MobilityBase	 UMETA(DisplayName = "Mobility Base"),
+	Manipulator		 UMETA(DisplayName = "Manipulator"),
+	HybridRobot		 UMETA(DisplayName = "Hybrid Robot"),
 };
 
 USTRUCT(BlueprintType)

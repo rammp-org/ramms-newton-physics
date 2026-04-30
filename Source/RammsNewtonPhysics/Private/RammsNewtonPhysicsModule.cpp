@@ -38,9 +38,9 @@ void FRammsNewtonPhysicsModule::RefreshBackendStatus()
 	CachedStatus.Mode = ERammsNewtonBackendMode::HeadersOnly;
 	CachedStatus.bRuntimeReady = false;
 	#if RAMMS_NEWTON_HAS_SOURCE_CHECKOUT
-		CachedStatus.Summary = TEXT("RammsNewtonPhysics: Newton source checkout detected, but direct UBT compilation is not wired yet. Add a prebuilt runtime or extend the ThirdParty module.");
+	CachedStatus.Summary = TEXT("RammsNewtonPhysics: Newton source checkout detected, but direct UBT compilation is not wired yet. Add a prebuilt runtime or extend the ThirdParty module.");
 	#else
-		CachedStatus.Summary = TEXT("RammsNewtonPhysics: Newton headers detected, but no prebuilt runtime library was found.");
+	CachedStatus.Summary = TEXT("RammsNewtonPhysics: Newton headers detected, but no prebuilt runtime library was found.");
 	#endif
 #else
 	CachedStatus.Mode = ERammsNewtonBackendMode::StubOnly;
