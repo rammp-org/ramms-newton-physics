@@ -18,6 +18,8 @@ public class RammsNewtonPhysics : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"Json",
+				"Projects",
 				"RammsNewtonPhysicsThirdParty",
 			});
 	}

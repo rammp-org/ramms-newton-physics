@@ -143,6 +143,13 @@ TArray<FName> URammsNewtonPhysicsComponent::GetManagedComponentNames() const
 	return Result;
 }
 
+void URammsNewtonPhysicsComponent::SetNativeRegistrationState(bool bInNativeRegistered, int32 InNativeBodyCount, const FString& InSummary)
+{
+	bNativeRuntimeRegistered = bInNativeRegistered;
+	NativeRegisteredBodyCount = InNativeBodyCount;
+	NativeRegistrationSummary = InSummary;
+}
+
 void URammsNewtonPhysicsComponent::HandleSimulationStep(float FixedStepSeconds)
 {
 	(void)FixedStepSeconds;
@@ -160,4 +167,45 @@ bool URammsNewtonPhysicsComponent::ShouldIncludeComponentName(FName ComponentNam
 	}
 
 	return !BridgeDescription.ExcludedPrimitiveComponents.Contains(ComponentName);
+}
+
+void URammsNewtonPhysicsComponent::GetManagedPrimitiveComponents(TArray<UPrimitiveComponent*>& OutPrimitiveComponents) const
+{
+	OutPrimitiveComponents.Reset();
+
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return;
+	}
+
+	const TArray<FName> ManagedNames = GetManagedComponentNames();
+	if (ManagedNames.Num() == 0)
+	{
+		return;
+	}
+
+	TSet<FName> ManagedNameSet;
+	ManagedNameSet.Append(ManagedNames);
+
+	TInlineComponentArray<UPrimitiveComponent*> PrimitiveComponents;
+	Owner->GetComponents(PrimitiveComponents);
+
+	TSet<FName> SeenNames;
+	for (UPrimitiveComponent* PrimitiveComponent : PrimitiveComponents)
+	{
+		if (!PrimitiveComponent)
+		{
+			continue;
+		}
+
+		const FName ComponentName = PrimitiveComponent->GetFName();
+		if (!ManagedNameSet.Contains(ComponentName) || SeenNames.Contains(ComponentName))
+		{
+			continue;
+		}
+
+		SeenNames.Add(ComponentName);
+		OutPrimitiveComponents.Add(PrimitiveComponent);
+	}
 }

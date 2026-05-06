@@ -23,9 +23,13 @@ public:
 
 	FRammsNewtonBackendStatus GetBackendStatus() const;
 	bool					  IsBackendReady() const;
+	void*					  GetRuntimeSymbol(const TCHAR* SymbolName) const;
 
 private:
-	void RefreshBackendStatus();
+	void			RefreshBackendStatus();
+	bool			TryLoadRuntimeLibrary(FString& OutLoadedPath);
+	TArray<FString> GetRuntimeLibraryCandidates() const;
 
 	FRammsNewtonBackendStatus CachedStatus;
+	void*					  RuntimeLibraryHandle = nullptr;
 };

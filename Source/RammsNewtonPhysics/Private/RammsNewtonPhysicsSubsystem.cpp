@@ -14,11 +14,21 @@ void URammsNewtonPhysicsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	RegisteredBridges.Reset();
 	AccumulatedTimeSeconds = 0.0f;
 	StepCounter = 0;
+	bAttemptedNativeBackendInit = false;
 	bLoggedUnavailable = false;
+	InitializeNativeBackendIfNeeded();
 }
 
 void URammsNewtonPhysicsSubsystem::Deinitialize()
 {
+	for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
+	{
+		if (Bridge.IsValid())
+		{
+			NativeBackend.UnregisterBridge(*Bridge.Get());
+		}
+	}
+	NativeBackend.Shutdown();
 	RegisteredBridges.Reset();
 	Super::Deinitialize();
 }
@@ -51,6 +61,12 @@ void URammsNewtonPhysicsSubsystem::Tick(float DeltaTime)
 		return;
 	}
 
+	InitializeNativeBackendIfNeeded();
+	if (!NativeBackend.IsInitialized())
+	{
+		return;
+	}
+
 	const float FixedStepSeconds = (Settings->FixedStepHz > KINDA_SMALL_NUMBER)
 		? (1.0f / Settings->FixedStepHz)
 		: (1.0f / 60.0f);
@@ -76,6 +92,10 @@ void URammsNewtonPhysicsSubsystem::RegisterBridge(URammsNewtonPhysicsComponent* 
 	if (Bridge)
 	{
 		RegisteredBridges.AddUnique(Bridge);
+		if (NativeBackend.IsInitialized())
+		{
+			NativeBackend.RegisterBridge(*Bridge);
+		}
 	}
 }
 
@@ -84,6 +104,10 @@ void URammsNewtonPhysicsSubsystem::UnregisterBridge(URammsNewtonPhysicsComponent
 	RegisteredBridges.RemoveAllSwap([Bridge](const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Candidate) {
 		return !Candidate.IsValid() || Candidate.Get() == Bridge;
 	});
+	if (Bridge)
+	{
+		NativeBackend.UnregisterBridge(*Bridge);
+	}
 }
 
 int32 URammsNewtonPhysicsSubsystem::GetRegisteredBridgeCount() const
@@ -104,8 +128,51 @@ FRammsNewtonBackendStatus URammsNewtonPhysicsSubsystem::GetBackendStatus() const
 	return FRammsNewtonPhysicsModule::Get().GetBackendStatus();
 }
 
+FRammsNewtonNativeWorldStatus URammsNewtonPhysicsSubsystem::GetNativeWorldStatus() const
+{
+	return NativeBackend.GetWorldStatus();
+}
+
+void URammsNewtonPhysicsSubsystem::InitializeNativeBackendIfNeeded()
+{
+	if (NativeBackend.IsInitialized())
+	{
+		return;
+	}
+	if (bAttemptedNativeBackendInit)
+	{
+		return;
+	}
+
+	const FRammsNewtonBackendStatus BackendStatus = GetBackendStatus();
+	if (!BackendStatus.bRuntimeReady)
+	{
+		return;
+	}
+
+	const URammsNewtonPhysicsSettings* Settings = GetDefault<URammsNewtonPhysicsSettings>();
+	if (!Settings)
+	{
+		return;
+	}
+
+	bAttemptedNativeBackendInit = true;
+	if (NativeBackend.Initialize(*Settings, BackendStatus))
+	{
+		for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
+		{
+			if (Bridge.IsValid())
+			{
+				NativeBackend.RegisterBridge(*Bridge.Get());
+			}
+		}
+	}
+}
+
 void URammsNewtonPhysicsSubsystem::StepSimulation(float FixedStepSeconds)
 {
+	NativeBackend.StepSimulation(FixedStepSeconds);
+
 	for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
 	{
 		if (Bridge.IsValid())

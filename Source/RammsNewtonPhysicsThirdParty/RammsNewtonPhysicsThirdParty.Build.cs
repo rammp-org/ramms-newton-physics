@@ -10,17 +10,23 @@ public class RammsNewtonPhysicsThirdParty : ModuleRules
 		Type = ModuleType.External;
 
 		string PluginDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", ".."));
-		string SourceCheckoutA = Path.Combine(PluginDir, "ThirdParty", "newton-dynamics");
-		string SourceCheckoutB = Path.Combine(PluginDir, "ThirdParty", "NewtonDynamics");
+		string SourceCheckoutA = Path.Combine(PluginDir, "ThirdParty", "newton");
+		string SourceCheckoutB = Path.Combine(PluginDir, "ThirdParty", "newton-dynamics");
+		string SourceCheckoutC = Path.Combine(PluginDir, "ThirdParty", "NewtonDynamics");
 		string PrebuiltRoot = Path.Combine(PluginDir, "ThirdParty", "Prebuilt", Target.Platform.ToString());
 
-		bool HasSourceCheckout = Directory.Exists(SourceCheckoutA) || Directory.Exists(SourceCheckoutB);
+		bool HasSourceCheckout =
+			Directory.Exists(SourceCheckoutA) ||
+			Directory.Exists(SourceCheckoutB) ||
+			Directory.Exists(SourceCheckoutC);
 		string[] IncludeCandidates =
 		{
 			Path.Combine(SourceCheckoutA, "include"),
 			Path.Combine(SourceCheckoutA, "sdk"),
 			Path.Combine(SourceCheckoutB, "include"),
 			Path.Combine(SourceCheckoutB, "sdk"),
+			Path.Combine(SourceCheckoutC, "include"),
+			Path.Combine(SourceCheckoutC, "sdk"),
 			Path.Combine(PrebuiltRoot, "include"),
 		};
 

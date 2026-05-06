@@ -1,0 +1,3 @@
+[submodule "ThirdParty/newton"]
+	path = ThirdParty/newton
+	url = https://github.com/newton-physics/newton.git

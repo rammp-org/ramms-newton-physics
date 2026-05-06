@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "RammsNewtonNativeBackend.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "RammsNewtonPhysicsTypes.h"
 #include "RammsNewtonPhysicsSubsystem.generated.h"
@@ -30,11 +31,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
 	FRammsNewtonBackendStatus GetBackendStatus() const;
 
+	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
+	FRammsNewtonNativeWorldStatus GetNativeWorldStatus() const;
+
 private:
+	void InitializeNativeBackendIfNeeded();
 	void StepSimulation(float FixedStepSeconds);
 
 	TArray<TWeakObjectPtr<URammsNewtonPhysicsComponent>> RegisteredBridges;
+	FRammsNewtonNativeBackend							 NativeBackend;
 	float												 AccumulatedTimeSeconds = 0.0f;
 	int64												 StepCounter = 0;
+	bool												 bAttemptedNativeBackendInit = false;
 	bool												 bLoggedUnavailable = false;
 };
