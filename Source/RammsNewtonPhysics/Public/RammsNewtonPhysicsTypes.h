@@ -106,6 +106,18 @@ struct RAMMSNEWTONPHYSICS_API FRammsNewtonJointDescription
 	FVector LocalAxis = FVector::ForwardVector;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")
+	bool bUseExplicitJointFrames = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton", meta = (EditCondition = "bUseExplicitJointFrames"))
+	FVector AxisInParentFrame = FVector::ForwardVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton", meta = (EditCondition = "bUseExplicitJointFrames"))
+	FTransform ParentAnchorTransform = FTransform::Identity;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton", meta = (EditCondition = "bUseExplicitJointFrames"))
+	FTransform ChildAnchorTransform = FTransform::Identity;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")
 	FName ConstraintName;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")

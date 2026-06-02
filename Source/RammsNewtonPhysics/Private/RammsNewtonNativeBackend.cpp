@@ -6,6 +6,7 @@
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Containers/StringConv.h"
@@ -13,6 +14,7 @@
 #include "Engine/StaticMesh.h"
 #include "GameFramework/Actor.h"
 #include "Interfaces/IPluginManager.h"
+#include "RammsNewtonArticulatedRobotComponent.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "RammsNewtonPhysicsComponent.h"
 #include "RammsNewtonPhysicsModule.h"
@@ -259,6 +261,90 @@ namespace RammsNewtonNative
 			&& ReadVec3Json(Object, TEXT("scale3d"), OutTransform.Scale3D);
 	}
 
+	static bool ParseJsonString(const FString& JsonText, TSharedPtr<FJsonObject>& OutObject)
+	{
+		OutObject.Reset();
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+		return FJsonSerializer::Deserialize(Reader, OutObject) && OutObject.IsValid();
+	}
+
+	static FString MakeScopedPythonJointName(const URammsNewtonPhysicsComponent& Bridge, const FString& LogicalJointName)
+	{
+		const FString OwnerName = GetNameSafe(Bridge.GetOwner());
+		return FString::Printf(TEXT("%s::%s"), OwnerName.IsEmpty() ? TEXT("bridge") : *OwnerName, *LogicalJointName);
+	}
+
+	static bool ReadExportTransformJson(const TSharedPtr<FJsonObject>& Object, FRammsNewtonNativeTransform& OutTransform)
+	{
+		if (!Object.IsValid())
+		{
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* TranslationValues = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* RotationValues = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* ScaleValues = nullptr;
+		if (!Object->TryGetArrayField(TEXT("translation_m"), TranslationValues) || !TranslationValues || TranslationValues->Num() < 3
+			|| !Object->TryGetArrayField(TEXT("rotation_xyzw"), RotationValues) || !RotationValues || RotationValues->Num() < 4)
+		{
+			return false;
+		}
+
+		OutTransform.TranslationCm.X = static_cast<float>((*TranslationValues)[0]->AsNumber() * 100.0);
+		OutTransform.TranslationCm.Y = static_cast<float>((*TranslationValues)[1]->AsNumber() * 100.0);
+		OutTransform.TranslationCm.Z = static_cast<float>((*TranslationValues)[2]->AsNumber() * 100.0);
+		OutTransform.Rotation.X = static_cast<float>((*RotationValues)[0]->AsNumber());
+		OutTransform.Rotation.Y = static_cast<float>((*RotationValues)[1]->AsNumber());
+		OutTransform.Rotation.Z = static_cast<float>((*RotationValues)[2]->AsNumber());
+		OutTransform.Rotation.W = static_cast<float>((*RotationValues)[3]->AsNumber());
+
+		if (Object->TryGetArrayField(TEXT("scale"), ScaleValues) && ScaleValues && ScaleValues->Num() >= 3)
+		{
+			OutTransform.Scale3D.X = static_cast<float>((*ScaleValues)[0]->AsNumber());
+			OutTransform.Scale3D.Y = static_cast<float>((*ScaleValues)[1]->AsNumber());
+			OutTransform.Scale3D.Z = static_cast<float>((*ScaleValues)[2]->AsNumber());
+		}
+		else
+		{
+			OutTransform.Scale3D = { 1.0f, 1.0f, 1.0f };
+		}
+
+		return true;
+	}
+
+	static TSharedRef<FJsonObject> MakeExportIdentityTransformJson()
+	{
+		TSharedRef<FJsonObject> TransformJson = MakeShared<FJsonObject>();
+		TransformJson->SetArrayField(TEXT("translation_m"), MakeJsonNumberArray({ 0.0, 0.0, 0.0 }));
+		TransformJson->SetArrayField(TEXT("rotation_xyzw"), MakeJsonNumberArray({ 0.0, 0.0, 0.0, 1.0 }));
+		TransformJson->SetArrayField(TEXT("scale"), MakeJsonNumberArray({ 1.0, 1.0, 1.0 }));
+		return TransformJson;
+	}
+
+	static bool AreNearlyEqual(const float A, const float B, const float Tolerance)
+	{
+		return FMath::Abs(A - B) <= Tolerance;
+	}
+
+	static bool AreTransformsEquivalent(
+		const FRammsNewtonNativeTransform& A,
+		const FRammsNewtonNativeTransform& B,
+		const float						   TranslationToleranceCm = 0.01f,
+		const float						   RotationTolerance = 1.0e-4f,
+		const float						   ScaleTolerance = 1.0e-4f)
+	{
+		return AreNearlyEqual(A.TranslationCm.X, B.TranslationCm.X, TranslationToleranceCm)
+			&& AreNearlyEqual(A.TranslationCm.Y, B.TranslationCm.Y, TranslationToleranceCm)
+			&& AreNearlyEqual(A.TranslationCm.Z, B.TranslationCm.Z, TranslationToleranceCm)
+			&& AreNearlyEqual(A.Rotation.X, B.Rotation.X, RotationTolerance)
+			&& AreNearlyEqual(A.Rotation.Y, B.Rotation.Y, RotationTolerance)
+			&& AreNearlyEqual(A.Rotation.Z, B.Rotation.Z, RotationTolerance)
+			&& AreNearlyEqual(A.Rotation.W, B.Rotation.W, RotationTolerance)
+			&& AreNearlyEqual(A.Scale3D.X, B.Scale3D.X, ScaleTolerance)
+			&& AreNearlyEqual(A.Scale3D.Y, B.Scale3D.Y, ScaleTolerance)
+			&& AreNearlyEqual(A.Scale3D.Z, B.Scale3D.Z, ScaleTolerance);
+	}
+
 	static FRammsNewtonNativeBodyShapeDesc MakeShapeDesc(const UPrimitiveComponent& PrimitiveComponent)
 	{
 		FRammsNewtonNativeBodyShapeDesc Shape;
@@ -294,6 +380,13 @@ namespace RammsNewtonNative
 		Shape.ShapeType = ERammsNewtonNativeShapeType::Box;
 		Shape.HalfExtentsCm = ToNativeVec3(HalfExtentsCm);
 		return Shape;
+	}
+
+	static bool HasPhysicsCollisionEnabled(const UPrimitiveComponent& PrimitiveComponent)
+	{
+		const ECollisionEnabled::Type CollisionEnabled = PrimitiveComponent.GetCollisionEnabled();
+		return CollisionEnabled == ECollisionEnabled::PhysicsOnly
+			|| CollisionEnabled == ECollisionEnabled::QueryAndPhysics;
 	}
 
 	static FRammsNewtonNativeBodyMaterialDesc ToNativeMaterialDesc(const FRammsNewtonMaterialDescription& Material)
@@ -619,6 +712,11 @@ void FRammsNewtonNativeBackend::Shutdown()
 				BridgeRecord->Bridge->SetNativeRegistrationState(false, 0, TEXT("Newton native backend shut down."));
 			}
 
+			for (const uint64 JointId : BridgeRecord->NativeJointIds)
+			{
+				DestroyPythonJoint(JointId);
+			}
+
 			for (const FRammsNewtonNativeBodyRecord& BodyRecord : BridgeRecord->Bodies)
 			{
 				if (BodyRecord.NativeBodyId != 0)
@@ -668,11 +766,6 @@ bool FRammsNewtonNativeBackend::RegisterBridge(URammsNewtonPhysicsComponent& Bri
 
 	TArray<UPrimitiveComponent*> ManagedPrimitiveComponents;
 	Bridge.GetManagedPrimitiveComponents(ManagedPrimitiveComponents);
-	if (ManagedPrimitiveComponents.Num() == 0)
-	{
-		Bridge.SetNativeRegistrationState(false, 0, TEXT("No managed primitive components were found for Newton registration."));
-		return false;
-	}
 
 	FBridgeRecord& BridgeRecord = BridgeRecords.Add(BridgeKey);
 	BridgeRecord.Bridge = &Bridge;
@@ -691,20 +784,39 @@ bool FRammsNewtonNativeBackend::RegisterBridge(URammsNewtonPhysicsComponent& Bri
 		}
 	}
 
+	if (bUsePythonBridge)
+	{
+		if (URammsNewtonArticulatedRobotComponent* ArticulatedBridge = Cast<URammsNewtonArticulatedRobotComponent>(&Bridge))
+		{
+			RegisterPythonArticulatedBridge(*ArticulatedBridge, BridgeRecord);
+		}
+	}
+
 	UpdateRegistrationCounts();
 
 	if (BridgeRecord.Bodies.Num() == 0)
 	{
-		Bridge.SetNativeRegistrationState(false, 0, TEXT("Managed components were found, but no native Newton bodies were created."));
+		Bridge.SetNativeRegistrationState(
+			false,
+			0,
+			ManagedPrimitiveComponents.Num() == 0
+				? TEXT("No managed primitive components or articulated link bodies were found for Newton registration.")
+				: TEXT("Managed components were found, but no native Newton bodies were created."));
 		BridgeRecords.Remove(BridgeKey);
 		UpdateRegistrationCounts();
 		return false;
 	}
 
+	const FString JointSummary = BridgeRecord.NativeJointIds.Num() > 0
+		? FString::Printf(TEXT(" and %d joint(s)"), BridgeRecord.NativeJointIds.Num())
+		: FString();
 	Bridge.SetNativeRegistrationState(
 		true,
 		BridgeRecord.Bodies.Num(),
-		FString::Printf(TEXT("Registered %d managed component(s) with the Newton backend."), BridgeRecord.Bodies.Num()));
+		FString::Printf(
+			TEXT("Registered %d managed component(s)%s with the Newton backend."),
+			BridgeRecord.Bodies.Num(),
+			*JointSummary));
 	return true;
 }
 
@@ -716,6 +828,11 @@ void FRammsNewtonNativeBackend::UnregisterBridge(URammsNewtonPhysicsComponent& B
 	{
 		Bridge.SetNativeRegistrationState(false, 0, TEXT("Not registered with the native Newton backend."));
 		return;
+	}
+
+	for (const uint64 JointId : BridgeRecord->NativeJointIds)
+	{
+		DestroyPythonJoint(JointId);
 	}
 
 	for (const FRammsNewtonNativeBodyRecord& BodyRecord : BridgeRecord->Bodies)
@@ -753,12 +870,22 @@ bool FRammsNewtonNativeBackend::StepSimulation(float FixedStepSeconds)
 
 void FRammsNewtonNativeBackend::SyncAllBridgesToNative()
 {
-	for (const TPair<FObjectKey, FBridgeRecord>& Pair : BridgeRecords)
+	for (TPair<FObjectKey, FBridgeRecord>& Pair : BridgeRecords)
 	{
-		const FBridgeRecord& BridgeRecord = Pair.Value;
+		FBridgeRecord& BridgeRecord = Pair.Value;
 		if (!BridgeRecord.Bridge.IsValid())
 		{
 			continue;
+		}
+
+		if (bUsePythonBridge && BridgeRecord.NativeJointIds.Num() > 0)
+		{
+			if (const URammsNewtonArticulatedRobotComponent* ArticulatedBridge =
+					Cast<URammsNewtonArticulatedRobotComponent>(BridgeRecord.Bridge.Get()))
+			{
+				PushPythonArticulationControls(*ArticulatedBridge);
+				continue;
+			}
 		}
 
 		if (!BridgeRecord.Bridge->BridgeDescription.bPushUnrealPosesToSolver)
@@ -766,7 +893,7 @@ void FRammsNewtonNativeBackend::SyncAllBridgesToNative()
 			continue;
 		}
 
-		for (const FRammsNewtonNativeBodyRecord& BodyRecord : BridgeRecord.Bodies)
+		for (FRammsNewtonNativeBodyRecord& BodyRecord : BridgeRecord.Bodies)
 		{
 			PushBodyTransformToNative(BodyRecord);
 		}
@@ -1222,8 +1349,437 @@ bool FRammsNewtonNativeBackend::GetBodyTransform(uint64 BodyId, FRammsNewtonNati
 		: false;
 }
 
+bool FRammsNewtonNativeBackend::RegisterPythonArticulatedBridge(
+	URammsNewtonArticulatedRobotComponent& Bridge,
+	FBridgeRecord&						   BridgeRecord)
+{
+	if (!bUsePythonBridge || PythonWorkerWorldId == 0)
+	{
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> ExportRoot;
+	if (!RammsNewtonNative::ParseJsonString(Bridge.GetEffectiveRobotExportJson(), ExportRoot))
+	{
+		UE_LOG(
+			LogRammsNewtonNativeBackend,
+			Warning,
+			TEXT("RammsNewtonPhysics: failed to parse articulated robot export JSON for '%s'."),
+			*GetNameSafe(Bridge.GetOwner()));
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> ControlRoot;
+	if (!RammsNewtonNative::ParseJsonString(Bridge.GetCurrentJointControlJson(), ControlRoot))
+	{
+		ControlRoot = MakeShared<FJsonObject>();
+	}
+
+	TSet<FString> SkeletalComponentNames;
+	if (const AActor* Owner = Bridge.GetOwner())
+	{
+		TInlineComponentArray<USkeletalMeshComponent*> SkeletalMeshComponents;
+		Owner->GetComponents(SkeletalMeshComponents);
+		for (const USkeletalMeshComponent* SkeletalMeshComponent : SkeletalMeshComponents)
+		{
+			if (SkeletalMeshComponent)
+			{
+				SkeletalComponentNames.Add(SkeletalMeshComponent->GetFName().ToString());
+			}
+		}
+	}
+
+	TMap<FString, uint64> LinkBodyIds;
+	for (const FRammsNewtonNativeBodyRecord& BodyRecord : BridgeRecord.Bodies)
+	{
+		if (BodyRecord.NativeBodyId != 0 && !BodyRecord.LinkName.IsNone())
+		{
+			LinkBodyIds.Add(BodyRecord.LinkName.ToString(), BodyRecord.NativeBodyId);
+		}
+	}
+
+	TMap<FString, TSharedPtr<FJsonObject>> LinkObjectsByName;
+	TMap<FString, TArray<FString>>		   ChildLinksByParentName;
+	TMap<FString, FVector>				   LinkPositionsCm;
+	if (const TArray<TSharedPtr<FJsonValue>>* LinkValues = nullptr; ExportRoot->TryGetArrayField(TEXT("links"), LinkValues) && LinkValues)
+	{
+		for (const TSharedPtr<FJsonValue>& LinkValue : *LinkValues)
+		{
+			const TSharedPtr<FJsonObject> LinkObject = LinkValue.IsValid() ? LinkValue->AsObject() : nullptr;
+			if (!LinkObject.IsValid())
+			{
+				continue;
+			}
+
+			FString LinkName;
+			FString ComponentName;
+			FString ParentName;
+			FString TransformSource;
+			LinkObject->TryGetStringField(TEXT("name"), LinkName);
+			LinkObject->TryGetStringField(TEXT("component_name"), ComponentName);
+			LinkObject->TryGetStringField(TEXT("parent_name"), ParentName);
+			LinkObject->TryGetStringField(TEXT("transform_source"), TransformSource);
+			if (LinkName.IsEmpty())
+			{
+				continue;
+			}
+
+			LinkObjectsByName.Add(LinkName, LinkObject);
+			if (!ParentName.IsEmpty())
+			{
+				ChildLinksByParentName.FindOrAdd(ParentName).Add(LinkName);
+			}
+
+			const TSharedPtr<FJsonObject>* WorldTransformObject = nullptr;
+			FRammsNewtonNativeTransform	   WorldTransform;
+			if (LinkObject->TryGetObjectField(TEXT("world_transform"), WorldTransformObject)
+				&& WorldTransformObject
+				&& RammsNewtonNative::ReadExportTransformJson(*WorldTransformObject, WorldTransform))
+			{
+				LinkPositionsCm.Add(
+					LinkName,
+					FVector(WorldTransform.TranslationCm.X, WorldTransform.TranslationCm.Y, WorldTransform.TranslationCm.Z));
+			}
+
+			const bool bShouldCreateSyntheticBody =
+				SkeletalComponentNames.Contains(ComponentName) || TransformSource.StartsWith(TEXT("bone:"));
+			if (LinkBodyIds.Contains(LinkName) || !bShouldCreateSyntheticBody)
+			{
+				continue;
+			}
+
+			FTCHARToUTF8 LinkNameUtf8(*LinkName);
+			FTCHARToUTF8 OwnerNameUtf8(*GetNameSafe(Bridge.GetOwner()));
+
+			FRammsNewtonNativeBodyCreateDesc BodyDesc;
+			BodyDesc.NameAnsi = LinkNameUtf8.Get();
+			BodyDesc.OwnerNameAnsi = OwnerNameUtf8.Get();
+			BodyDesc.MassKg = 1.0f;
+			LinkObject->TryGetNumberField(TEXT("mass_kg"), BodyDesc.MassKg);
+			LinkObject->TryGetBoolField(TEXT("kinematic"), BodyDesc.bKinematic);
+			if (!WorldTransformObject || !RammsNewtonNative::ReadExportTransformJson(*WorldTransformObject, BodyDesc.Transform))
+			{
+				continue;
+			}
+
+			float SegmentLengthCm = 10.0f;
+			if (const TArray<FString>* ChildLinkNames = ChildLinksByParentName.Find(LinkName))
+			{
+				float AccumulatedDistanceCm = 0.0f;
+				int32 ValidChildCount = 0;
+				for (const FString& ChildLinkName : *ChildLinkNames)
+				{
+					if (const FVector* ChildPosition = LinkPositionsCm.Find(ChildLinkName))
+					{
+						AccumulatedDistanceCm += FVector::Distance(LinkPositionsCm.FindRef(LinkName), *ChildPosition);
+						++ValidChildCount;
+					}
+				}
+				if (ValidChildCount > 0)
+				{
+					SegmentLengthCm = AccumulatedDistanceCm / ValidChildCount;
+				}
+			}
+			else if (!ParentName.IsEmpty())
+			{
+				if (const FVector* ParentPosition = LinkPositionsCm.Find(ParentName))
+				{
+					SegmentLengthCm = FVector::Distance(*ParentPosition, LinkPositionsCm.FindRef(LinkName));
+				}
+			}
+
+			SegmentLengthCm = FMath::Clamp(SegmentLengthCm, 5.0f, 100.0f);
+			const float ThicknessCm = FMath::Clamp(SegmentLengthCm * 0.25f, 2.0f, 12.0f);
+			BodyDesc.Shape.ShapeType = ERammsNewtonNativeShapeType::Box;
+			BodyDesc.Shape.HalfExtentsCm = {
+				FMath::Max(SegmentLengthCm * 0.5f, 1.0f),
+				FMath::Max(ThicknessCm * 0.5f, 1.0f),
+				FMath::Max(ThicknessCm * 0.5f, 1.0f),
+			};
+			BodyDesc.Material = RammsNewtonNative::ToNativeMaterialDesc(Bridge.BridgeDescription.DefaultMaterial);
+
+			const uint64 NativeBodyId = CreateBody(BodyDesc);
+			if (NativeBodyId == 0)
+			{
+				continue;
+			}
+
+			FRammsNewtonNativeBodyRecord BodyRecord;
+			BodyRecord.NativeBodyId = NativeBodyId;
+			BodyRecord.LinkName = *LinkName;
+			BodyRecord.ComponentName = *ComponentName;
+			BodyRecord.BoneName = *LinkName;
+			BodyRecord.LastPushedTransform = BodyDesc.Transform;
+			BodyRecord.bHasLastPushedTransform = true;
+			BridgeRecord.Bodies.Add(BodyRecord);
+			LinkBodyIds.Add(LinkName, NativeBodyId);
+		}
+	}
+
+	if (LinkBodyIds.Num() == 0)
+	{
+		return false;
+	}
+
+	TMap<FString, TSharedPtr<FJsonObject>> JointControlsByName;
+	if (ControlRoot.IsValid())
+	{
+		if (const TArray<TSharedPtr<FJsonValue>>* ControlValues = nullptr;
+			ControlRoot->TryGetArrayField(TEXT("joints"), ControlValues) && ControlValues)
+		{
+			for (const TSharedPtr<FJsonValue>& ControlValue : *ControlValues)
+			{
+				const TSharedPtr<FJsonObject> ControlObject = ControlValue.IsValid() ? ControlValue->AsObject() : nullptr;
+				if (!ControlObject.IsValid())
+				{
+					continue;
+				}
+
+				FString JointName;
+				if (ControlObject->TryGetStringField(TEXT("name"), JointName) && !JointName.IsEmpty())
+				{
+					JointControlsByName.Add(JointName, ControlObject);
+				}
+			}
+		}
+	}
+
+	if (const TArray<TSharedPtr<FJsonValue>>* JointValues = nullptr; ExportRoot->TryGetArrayField(TEXT("joints"), JointValues) && JointValues)
+	{
+		for (const TSharedPtr<FJsonValue>& JointValue : *JointValues)
+		{
+			const TSharedPtr<FJsonObject> JointObject = JointValue.IsValid() ? JointValue->AsObject() : nullptr;
+			if (!JointObject.IsValid())
+			{
+				continue;
+			}
+
+			FString JointName;
+			FString ParentLinkName;
+			FString ChildLinkName;
+			JointObject->TryGetStringField(TEXT("name"), JointName);
+			JointObject->TryGetStringField(TEXT("parent_link_name"), ParentLinkName);
+			JointObject->TryGetStringField(TEXT("child_link_name"), ChildLinkName);
+			if (JointName.IsEmpty() || ChildLinkName.IsEmpty())
+			{
+				continue;
+			}
+
+			const uint64 ChildBodyId = LinkBodyIds.FindRef(ChildLinkName);
+			const uint64 ParentBodyId = LinkBodyIds.FindRef(ParentLinkName);
+			if (ChildBodyId == 0 || ParentBodyId == ChildBodyId)
+			{
+				continue;
+			}
+
+			TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+			Params->SetNumberField(TEXT("world_id"), static_cast<double>(PythonWorkerWorldId));
+			Params->SetNumberField(TEXT("parent_body_id"), static_cast<double>(ParentBodyId));
+			Params->SetNumberField(TEXT("child_body_id"), static_cast<double>(ChildBodyId));
+			Params->SetStringField(TEXT("joint_name"), RammsNewtonNative::MakeScopedPythonJointName(Bridge, JointName));
+
+			FString JointType;
+			if (JointObject->TryGetStringField(TEXT("joint_type"), JointType) && !JointType.IsEmpty())
+			{
+				Params->SetStringField(TEXT("joint_type"), JointType);
+			}
+
+			FString DriveMode;
+			if (JointObject->TryGetStringField(TEXT("drive_mode"), DriveMode) && !DriveMode.IsEmpty())
+			{
+				Params->SetStringField(TEXT("drive_mode"), DriveMode);
+			}
+
+			if (const TSharedPtr<FJsonObject>* ChildLinkObject = LinkObjectsByName.Find(ChildLinkName))
+			{
+				const TSharedPtr<FJsonObject> LinkObject = *ChildLinkObject;
+				bool						  bUseExplicitJointFrames = false;
+				JointObject->TryGetBoolField(TEXT("use_explicit_joint_frames"), bUseExplicitJointFrames);
+
+				const TSharedPtr<FJsonObject>* AnchorTransform = nullptr;
+				if (bUseExplicitJointFrames)
+				{
+					if (JointObject->TryGetObjectField(TEXT("parent_anchor_transform"), AnchorTransform) && AnchorTransform && AnchorTransform->IsValid())
+					{
+						Params->SetObjectField(TEXT("parent_anchor_transform"), *AnchorTransform);
+					}
+					if (JointObject->TryGetObjectField(TEXT("child_anchor_transform"), AnchorTransform) && AnchorTransform && AnchorTransform->IsValid())
+					{
+						Params->SetObjectField(TEXT("child_anchor_transform"), *AnchorTransform);
+					}
+				}
+				else
+				{
+					if (ParentBodyId != 0 && LinkObject->TryGetObjectField(TEXT("relative_transform"), AnchorTransform) && AnchorTransform && AnchorTransform->IsValid())
+					{
+						Params->SetObjectField(TEXT("parent_anchor_transform"), *AnchorTransform);
+					}
+					else if (LinkObject->TryGetObjectField(TEXT("world_transform"), AnchorTransform) && AnchorTransform && AnchorTransform->IsValid())
+					{
+						Params->SetObjectField(TEXT("parent_anchor_transform"), *AnchorTransform);
+					}
+
+					Params->SetObjectField(TEXT("child_anchor_transform"), RammsNewtonNative::MakeExportIdentityTransformJson());
+				}
+			}
+
+			if (const TArray<TSharedPtr<FJsonValue>>* AxisValues = nullptr;
+				(JointObject->TryGetArrayField(TEXT("axis_in_parent_frame"), AxisValues)
+					|| JointObject->TryGetArrayField(TEXT("axis"), AxisValues))
+				&& AxisValues)
+			{
+				Params->SetArrayField(TEXT("axis"), *AxisValues);
+			}
+
+			bool bUseLimits = false;
+			if (JointObject->TryGetBoolField(TEXT("use_limits"), bUseLimits))
+			{
+				Params->SetBoolField(TEXT("use_limits"), bUseLimits);
+			}
+
+			double MinLimitDegrees = 0.0;
+			if (JointObject->TryGetNumberField(TEXT("min_limit_degrees"), MinLimitDegrees))
+			{
+				Params->SetNumberField(TEXT("min_limit_degrees"), MinLimitDegrees);
+			}
+
+			double MaxLimitDegrees = 0.0;
+			if (JointObject->TryGetNumberField(TEXT("max_limit_degrees"), MaxLimitDegrees))
+			{
+				Params->SetNumberField(TEXT("max_limit_degrees"), MaxLimitDegrees);
+			}
+
+			double MaxEffort = 0.0;
+			if (JointObject->TryGetNumberField(TEXT("max_effort"), MaxEffort))
+			{
+				Params->SetNumberField(TEXT("max_effort"), MaxEffort);
+			}
+
+			if (const TSharedPtr<FJsonObject>* ControlObject = JointControlsByName.Find(JointName))
+			{
+				const TSharedPtr<FJsonObject> ControlJson = *ControlObject;
+				static const TCHAR*			  NumericFields[] = {
+							  TEXT("target_angle_degrees"),
+							  TEXT("current_angle_degrees"),
+							  TEXT("target_velocity_degrees_per_second"),
+							  TEXT("position_gain"),
+							  TEXT("damping_gain"),
+							  TEXT("feedforward_effort"),
+							  TEXT("max_effort"),
+				};
+
+				for (const TCHAR* FieldName : NumericFields)
+				{
+					double Value = 0.0;
+					if (ControlJson->TryGetNumberField(FieldName, Value))
+					{
+						Params->SetNumberField(FieldName, Value);
+					}
+				}
+
+				FString OverrideDriveMode;
+				if (ControlJson->TryGetStringField(TEXT("drive_mode"), OverrideDriveMode) && !OverrideDriveMode.IsEmpty())
+				{
+					Params->SetStringField(TEXT("drive_mode"), OverrideDriveMode);
+				}
+			}
+
+			const uint64 JointId = CreatePythonJoint(Params);
+			if (JointId != 0)
+			{
+				BridgeRecord.NativeJointIds.Add(JointId);
+			}
+		}
+	}
+
+	return BridgeRecord.NativeJointIds.Num() > 0;
+}
+
+uint64 FRammsNewtonNativeBackend::CreatePythonJoint(const TSharedRef<FJsonObject>& Params)
+{
+	if (!bUsePythonBridge)
+	{
+		return 0;
+	}
+
+	TSharedPtr<FJsonObject> Result;
+	if (!SendPythonRequest(TEXT("create_joint"), Params, Result))
+	{
+		return 0;
+	}
+
+	double JointId = 0.0;
+	return Result->TryGetNumberField(TEXT("joint_id"), JointId) ? static_cast<uint64>(JointId) : 0;
+}
+
+void FRammsNewtonNativeBackend::DestroyPythonJoint(uint64 JointId)
+{
+	if (!bUsePythonBridge || JointId == 0 || PythonWorkerWorldId == 0)
+	{
+		return;
+	}
+
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetNumberField(TEXT("world_id"), static_cast<double>(PythonWorkerWorldId));
+	Params->SetNumberField(TEXT("joint_id"), static_cast<double>(JointId));
+
+	TSharedPtr<FJsonObject> UnusedResult;
+	SendPythonRequest(TEXT("destroy_joint"), Params, UnusedResult);
+}
+
+bool FRammsNewtonNativeBackend::PushPythonArticulationControls(const URammsNewtonArticulatedRobotComponent& Bridge)
+{
+	if (!bUsePythonBridge || PythonWorkerWorldId == 0)
+	{
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> ControlRoot;
+	if (!RammsNewtonNative::ParseJsonString(Bridge.GetCurrentJointControlJson(), ControlRoot) || !ControlRoot.IsValid())
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* JointValues = nullptr;
+	if (!ControlRoot->TryGetArrayField(TEXT("joints"), JointValues) || !JointValues || JointValues->Num() == 0)
+	{
+		return true;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ScopedJointValues;
+	ScopedJointValues.Reserve(JointValues->Num());
+	for (const TSharedPtr<FJsonValue>& JointValue : *JointValues)
+	{
+		const TSharedPtr<FJsonObject> JointObject = JointValue.IsValid() ? JointValue->AsObject() : nullptr;
+		if (!JointObject.IsValid())
+		{
+			continue;
+		}
+
+		TSharedRef<FJsonObject> ScopedJointObject = MakeShared<FJsonObject>(*JointObject);
+		FString					LogicalJointName;
+		if (ScopedJointObject->TryGetStringField(TEXT("name"), LogicalJointName) && !LogicalJointName.IsEmpty())
+		{
+			ScopedJointObject->SetStringField(TEXT("name"), RammsNewtonNative::MakeScopedPythonJointName(Bridge, LogicalJointName));
+		}
+		ScopedJointValues.Add(MakeShared<FJsonValueObject>(ScopedJointObject));
+	}
+
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetNumberField(TEXT("world_id"), static_cast<double>(PythonWorkerWorldId));
+	Params->SetArrayField(TEXT("joints"), ScopedJointValues);
+
+	TSharedPtr<FJsonObject> Result;
+	return SendPythonRequest(TEXT("set_joint_controls"), Params, Result);
+}
+
 bool FRammsNewtonNativeBackend::CreateNativeBody(URammsNewtonPhysicsComponent& Bridge, UPrimitiveComponent& PrimitiveComponent, FRammsNewtonNativeBodyRecord& OutRecord)
 {
+	if (!RammsNewtonNative::HasPhysicsCollisionEnabled(PrimitiveComponent))
+	{
+		return false;
+	}
+
 	FTCHARToUTF8 ComponentNameUtf8(*PrimitiveComponent.GetName());
 	FTCHARToUTF8 OwnerNameUtf8(*GetNameSafe(Bridge.GetOwner()));
 
@@ -1235,14 +1791,10 @@ bool FRammsNewtonNativeBackend::CreateNativeBody(URammsNewtonPhysicsComponent& B
 	const ERammsNewtonCollisionGeometryMode CollisionGeometryMode =
 		RammsNewtonNative::ResolveCollisionGeometryMode(Bridge, PrimitiveComponent, bTreatAsDynamicInNewton);
 	BodyDesc.bKinematic = !bTreatAsDynamicInNewton;
-	const ECollisionEnabled::Type CollisionEnabled = PrimitiveComponent.GetCollisionEnabled();
-	const bool					  bPhysicsCollisionEnabled =
-		CollisionEnabled == ECollisionEnabled::PhysicsOnly
-		|| CollisionEnabled == ECollisionEnabled::QueryAndPhysics;
 	BodyDesc.MassKg = 0.0f;
 	if (!BodyDesc.bKinematic)
 	{
-		BodyDesc.MassKg = (PrimitiveComponent.IsSimulatingPhysics() && bPhysicsCollisionEnabled)
+		BodyDesc.MassKg = (PrimitiveComponent.IsSimulatingPhysics() && RammsNewtonNative::HasPhysicsCollisionEnabled(PrimitiveComponent))
 			? FMath::Max(PrimitiveComponent.GetMass(), 0.001f)
 			: 1.0f;
 	}
@@ -1290,12 +1842,15 @@ bool FRammsNewtonNativeBackend::CreateNativeBody(URammsNewtonPhysicsComponent& B
 	}
 
 	OutRecord.NativeBodyId = NativeBodyId;
+	OutRecord.LinkName = PrimitiveComponent.GetFName();
 	OutRecord.ComponentName = PrimitiveComponent.GetFName();
 	OutRecord.PrimitiveComponent = &PrimitiveComponent;
+	OutRecord.LastPushedTransform = BodyDesc.Transform;
+	OutRecord.bHasLastPushedTransform = true;
 	return true;
 }
 
-bool FRammsNewtonNativeBackend::PushBodyTransformToNative(const FRammsNewtonNativeBodyRecord& BodyRecord)
+bool FRammsNewtonNativeBackend::PushBodyTransformToNative(FRammsNewtonNativeBodyRecord& BodyRecord)
 {
 	if (!BodyRecord.PrimitiveComponent.IsValid())
 	{
@@ -1304,7 +1859,19 @@ bool FRammsNewtonNativeBackend::PushBodyTransformToNative(const FRammsNewtonNati
 
 	const FRammsNewtonNativeTransform NativeTransform =
 		RammsNewtonNative::ToNativeTransform(BodyRecord.PrimitiveComponent->GetComponentTransform());
-	return SetBodyTransform(BodyRecord.NativeBodyId, NativeTransform);
+	if (BodyRecord.bHasLastPushedTransform
+		&& RammsNewtonNative::AreTransformsEquivalent(BodyRecord.LastPushedTransform, NativeTransform))
+	{
+		return true;
+	}
+
+	const bool bUpdated = SetBodyTransform(BodyRecord.NativeBodyId, NativeTransform);
+	if (bUpdated)
+	{
+		BodyRecord.LastPushedTransform = NativeTransform;
+		BodyRecord.bHasLastPushedTransform = true;
+	}
+	return bUpdated;
 }
 
 bool FRammsNewtonNativeBackend::PullBodyTransformFromNative(const FRammsNewtonNativeBodyRecord& BodyRecord)
@@ -1519,46 +2086,105 @@ bool FRammsNewtonNativeBackend::ApplyPythonStepTransforms(const TSharedPtr<FJson
 		return true;
 	}
 
-	const TArray<TSharedPtr<FJsonValue>>* BodyTransforms = nullptr;
-	if (!Result->TryGetArrayField(TEXT("body_transforms"), BodyTransforms) || !BodyTransforms)
+	const TArray<TSharedPtr<FJsonValue>>*	  BodyTransforms = nullptr;
+	TMap<uint64, FRammsNewtonNativeTransform> TransformsByBodyId;
+	if (Result->TryGetArrayField(TEXT("body_transforms"), BodyTransforms) && BodyTransforms)
 	{
-		return true;
+		for (const TSharedPtr<FJsonValue>& EntryValue : *BodyTransforms)
+		{
+			if (!EntryValue.IsValid())
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject>* EntryObject = nullptr;
+			if (!EntryValue->TryGetObject(EntryObject) || !EntryObject || !EntryObject->IsValid())
+			{
+				continue;
+			}
+
+			double						   BodyIdValue = 0.0;
+			const TSharedPtr<FJsonObject>* TransformObject = nullptr;
+			if (!(*EntryObject)->TryGetNumberField(TEXT("body_id"), BodyIdValue)
+				|| !(*EntryObject)->TryGetObjectField(TEXT("transform"), TransformObject)
+				|| !TransformObject)
+			{
+				continue;
+			}
+
+			FRammsNewtonNativeTransform Transform;
+			if (RammsNewtonNative::ReadTransformJson(*TransformObject, Transform))
+			{
+				TransformsByBodyId.Add(static_cast<uint64>(BodyIdValue), Transform);
+			}
+		}
 	}
 
-	TMap<uint64, FRammsNewtonNativeTransform> TransformsByBodyId;
-	for (const TSharedPtr<FJsonValue>& EntryValue : *BodyTransforms)
+	TMap<FString, float>				  JointPositionsByName;
+	TMap<FString, float>				  JointVelocitiesByName;
+	const TArray<TSharedPtr<FJsonValue>>* JointStates = nullptr;
+	if (Result->TryGetArrayField(TEXT("joint_states"), JointStates) && JointStates)
 	{
-		if (!EntryValue.IsValid())
+		for (const TSharedPtr<FJsonValue>& JointValue : *JointStates)
 		{
-			continue;
-		}
+			const TSharedPtr<FJsonObject> JointObject = JointValue.IsValid() ? JointValue->AsObject() : nullptr;
+			if (!JointObject.IsValid())
+			{
+				continue;
+			}
 
-		const TSharedPtr<FJsonObject>* EntryObject = nullptr;
-		if (!EntryValue->TryGetObject(EntryObject) || !EntryObject || !EntryObject->IsValid())
-		{
-			continue;
-		}
+			FString JointName;
+			double	JointPosition = 0.0;
+			double	JointVelocity = 0.0;
+			if (!JointObject->TryGetStringField(TEXT("name"), JointName) || JointName.IsEmpty())
+			{
+				continue;
+			}
 
-		double						   BodyIdValue = 0.0;
-		const TSharedPtr<FJsonObject>* TransformObject = nullptr;
-		if (!(*EntryObject)->TryGetNumberField(TEXT("body_id"), BodyIdValue)
-			|| !(*EntryObject)->TryGetObjectField(TEXT("transform"), TransformObject)
-			|| !TransformObject)
-		{
-			continue;
-		}
-
-		FRammsNewtonNativeTransform Transform;
-		if (RammsNewtonNative::ReadTransformJson(*TransformObject, Transform))
-		{
-			TransformsByBodyId.Add(static_cast<uint64>(BodyIdValue), Transform);
+			JointObject->TryGetNumberField(TEXT("position"), JointPosition);
+			JointObject->TryGetNumberField(TEXT("velocity"), JointVelocity);
+			JointPositionsByName.Add(JointName, static_cast<float>(JointPosition));
+			JointVelocitiesByName.Add(JointName, static_cast<float>(JointVelocity));
 		}
 	}
 
 	for (const TPair<FObjectKey, FBridgeRecord>& Pair : BridgeRecords)
 	{
 		const FBridgeRecord& BridgeRecord = Pair.Value;
-		if (!BridgeRecord.Bridge.IsValid() || !BridgeRecord.Bridge->BridgeDescription.bPullSolverPosesBackToUnreal)
+		if (!BridgeRecord.Bridge.IsValid())
+		{
+			continue;
+		}
+
+		if (JointPositionsByName.Num() > 0)
+		{
+			TMap<FName, float> ScopedJointPositions;
+			TMap<FName, float> ScopedJointVelocities;
+			const FString	   ScopedPrefix = FString::Printf(
+					 TEXT("%s::"),
+					 *GetNameSafe(BridgeRecord.Bridge->GetOwner()));
+			for (const TPair<FString, float>& JointPair : JointPositionsByName)
+			{
+				if (!JointPair.Key.StartsWith(ScopedPrefix))
+				{
+					continue;
+				}
+
+				const FString LogicalJointName = JointPair.Key.RightChop(ScopedPrefix.Len());
+				ScopedJointPositions.Add(*LogicalJointName, JointPair.Value);
+				if (const float* VelocityValue = JointVelocitiesByName.Find(JointPair.Key))
+				{
+					ScopedJointVelocities.Add(*LogicalJointName, *VelocityValue);
+				}
+			}
+
+			if (ScopedJointPositions.Num() > 0)
+			{
+				BridgeRecord.Bridge->ApplySolvedJointStates(ScopedJointPositions, ScopedJointVelocities);
+			}
+		}
+
+		if (!BridgeRecord.Bridge->BridgeDescription.bPullSolverPosesBackToUnreal)
 		{
 			continue;
 		}

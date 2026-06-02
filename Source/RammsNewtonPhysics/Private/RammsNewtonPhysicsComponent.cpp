@@ -55,9 +55,27 @@ bool URammsNewtonPhysicsComponent::RegisterWithSubsystem()
 
 	if (bLogRegistration)
 	{
-		UE_LOG(LogRammsNewtonPhysicsComponent, Log, TEXT("[Newton] Registered '%s' with %d managed components"),
+		const TArray<FName> ManagedComponentNames = GetManagedComponentNames();
+		TArray<FString>		ManagedComponentNameStrings;
+		ManagedComponentNameStrings.Reserve(ManagedComponentNames.Num());
+		for (const FName ManagedComponentName : ManagedComponentNames)
+		{
+			ManagedComponentNameStrings.Add(ManagedComponentName.ToString());
+		}
+
+		TArray<FString> ExcludedComponentNameStrings;
+		ExcludedComponentNameStrings.Reserve(BridgeDescription.ExcludedPrimitiveComponents.Num());
+		for (const FName ExcludedComponentName : BridgeDescription.ExcludedPrimitiveComponents)
+		{
+			ExcludedComponentNameStrings.Add(ExcludedComponentName.ToString());
+		}
+
+		UE_LOG(LogRammsNewtonPhysicsComponent, Log,
+			TEXT("[Newton] Registered '%s' with managed components [%s], excluded [%s], native bodies %d"),
 			*GetNameSafe(GetOwner()),
-			GetManagedComponentNames().Num());
+			*FString::Join(ManagedComponentNameStrings, TEXT(", ")),
+			*FString::Join(ExcludedComponentNameStrings, TEXT(", ")),
+			NativeRegisteredBodyCount);
 	}
 
 	return true;
@@ -87,6 +105,11 @@ FRammsNewtonBackendStatus URammsNewtonPhysicsComponent::GetBackendStatus() const
 }
 
 TArray<FName> URammsNewtonPhysicsComponent::GetManagedComponentNames() const
+{
+	return GetManagedComponentNamesFromBridgeDescription();
+}
+
+TArray<FName> URammsNewtonPhysicsComponent::GetManagedComponentNamesFromBridgeDescription() const
 {
 	TSet<FName> ManagedNames;
 
@@ -157,6 +180,14 @@ void URammsNewtonPhysicsComponent::HandleSimulationStep(float FixedStepSeconds)
 	//  1. Push selected actor/component state into Newton
 	//  2. Step the Newton world / articulation graph
 	//  3. Pull transforms, joint state, and contact data back into UE
+}
+
+void URammsNewtonPhysicsComponent::ApplySolvedJointStates(
+	const TMap<FName, float>& JointPositions,
+	const TMap<FName, float>& JointVelocities)
+{
+	(void)JointPositions;
+	(void)JointVelocities;
 }
 
 bool URammsNewtonPhysicsComponent::ShouldIncludeComponentName(FName ComponentName) const

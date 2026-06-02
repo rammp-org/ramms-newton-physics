@@ -11,6 +11,8 @@
 class FJsonObject;
 class FEvent;
 class UPrimitiveComponent;
+class USkeletalMeshComponent;
+class URammsNewtonArticulatedRobotComponent;
 class URammsNewtonPhysicsComponent;
 class URammsNewtonPhysicsSettings;
 
@@ -94,9 +96,14 @@ struct FRammsNewtonNativeBodyCreateDesc
 
 struct FRammsNewtonNativeBodyRecord
 {
-	uint64								NativeBodyId = 0;
-	FName								ComponentName;
-	TWeakObjectPtr<UPrimitiveComponent> PrimitiveComponent;
+	uint64								   NativeBodyId = 0;
+	FName								   LinkName;
+	FName								   ComponentName;
+	FName								   BoneName;
+	TWeakObjectPtr<UPrimitiveComponent>	   PrimitiveComponent;
+	TWeakObjectPtr<USkeletalMeshComponent> SkeletalMeshComponent;
+	FRammsNewtonNativeTransform			   LastPushedTransform;
+	bool								   bHasLastPushedTransform = false;
 
 	bool IsValid() const
 	{
@@ -130,6 +137,7 @@ private:
 	{
 		TWeakObjectPtr<URammsNewtonPhysicsComponent> Bridge;
 		TArray<FRammsNewtonNativeBodyRecord>		 Bodies;
+		TArray<uint64>								 NativeJointIds;
 	};
 
 	bool				 BindExports();
@@ -148,7 +156,11 @@ private:
 	bool				 SetBodyTransform(uint64 BodyId, const FRammsNewtonNativeTransform& Transform);
 	bool				 GetBodyTransform(uint64 BodyId, FRammsNewtonNativeTransform& OutTransform);
 	bool				 CreateNativeBody(URammsNewtonPhysicsComponent& Bridge, UPrimitiveComponent& PrimitiveComponent, FRammsNewtonNativeBodyRecord& OutRecord);
-	bool				 PushBodyTransformToNative(const FRammsNewtonNativeBodyRecord& BodyRecord);
+	bool				 RegisterPythonArticulatedBridge(URammsNewtonArticulatedRobotComponent& Bridge, FBridgeRecord& BridgeRecord);
+	uint64				 CreatePythonJoint(const TSharedRef<FJsonObject>& Params);
+	void				 DestroyPythonJoint(uint64 JointId);
+	bool				 PushPythonArticulationControls(const URammsNewtonArticulatedRobotComponent& Bridge);
+	bool				 PushBodyTransformToNative(FRammsNewtonNativeBodyRecord& BodyRecord);
 	bool				 PullBodyTransformFromNative(const FRammsNewtonNativeBodyRecord& BodyRecord);
 	void				 StartPythonOutputReader();
 	void				 StopPythonOutputReader();

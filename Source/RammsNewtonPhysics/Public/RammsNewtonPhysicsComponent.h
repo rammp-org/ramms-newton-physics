@@ -51,12 +51,14 @@ public:
 	FRammsNewtonBackendStatus GetBackendStatus() const;
 
 	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
-	TArray<FName> GetManagedComponentNames() const;
+	virtual TArray<FName> GetManagedComponentNames() const;
 
-	void		 GetManagedPrimitiveComponents(TArray<UPrimitiveComponent*>& OutPrimitiveComponents) const;
+	virtual void GetManagedPrimitiveComponents(TArray<UPrimitiveComponent*>& OutPrimitiveComponents) const;
 	virtual void HandleSimulationStep(float FixedStepSeconds);
+	virtual void ApplySolvedJointStates(const TMap<FName, float>& JointPositions, const TMap<FName, float>& JointVelocities);
 	void		 SetNativeRegistrationState(bool bInNativeRegistered, int32 InNativeBodyCount, const FString& InSummary);
 
 protected:
-	bool ShouldIncludeComponentName(FName ComponentName) const;
+	TArray<FName> GetManagedComponentNamesFromBridgeDescription() const;
+	bool		  ShouldIncludeComponentName(FName ComponentName) const;
 };

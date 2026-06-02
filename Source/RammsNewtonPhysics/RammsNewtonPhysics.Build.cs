@@ -20,6 +20,7 @@ public class RammsNewtonPhysics : ModuleRules
 			{
 				"Json",
 				"Projects",
+				"RammsCore",
 				"RammsNewtonPhysicsThirdParty",
 			});
 	}

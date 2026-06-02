@@ -10,10 +10,16 @@
 	"DocsURL": "",
 	"MarketplaceURL": "",
 	"SupportURL": "",
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": true,
 	"IsExperimentalVersion": true,
 	"Installed": false,
+	"Plugins": [
+		{
+			"Name": "RammsCore",
+			"Enabled": true
+		}
+	],
 	"Modules": [
 		{
 			"Name": "RammsNewtonPhysics",

@@ -9,6 +9,7 @@ on UE's editor-only embedded Python runtime.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -71,6 +72,68 @@ def _default_scale() -> dict[str, float]:
     return {"x": 1.0, "y": 1.0, "z": 1.0}
 
 
+def _export_transform_to_body_transform(transform: dict[str, Any]) -> dict[str, Any]:
+    translation = list(transform.get("translation_m", [0.0, 0.0, 0.0]))
+    rotation = list(transform.get("rotation_xyzw", [0.0, 0.0, 0.0, 1.0]))
+    scale = list(transform.get("scale", [1.0, 1.0, 1.0]))
+    return {
+        "translation_cm": {
+            "x": float(translation[0] if len(translation) > 0 else 0.0) * 100.0,
+            "y": float(translation[1] if len(translation) > 1 else 0.0) * 100.0,
+            "z": float(translation[2] if len(translation) > 2 else 0.0) * 100.0,
+        },
+        "rotation": {
+            "x": float(rotation[0] if len(rotation) > 0 else 0.0),
+            "y": float(rotation[1] if len(rotation) > 1 else 0.0),
+            "z": float(rotation[2] if len(rotation) > 2 else 0.0),
+            "w": float(rotation[3] if len(rotation) > 3 else 1.0),
+        },
+        "scale3d": {
+            "x": float(scale[0] if len(scale) > 0 else 1.0),
+            "y": float(scale[1] if len(scale) > 1 else 1.0),
+            "z": float(scale[2] if len(scale) > 2 else 1.0),
+        },
+    }
+
+
+def _export_transform_to_newton(transform: dict[str, Any] | None) -> Any:
+    if not transform:
+        return _identity_transform()
+
+    translation = list(transform.get("translation_m", [0.0, 0.0, 0.0]))
+    rotation = list(transform.get("rotation_xyzw", [0.0, 0.0, 0.0, 1.0]))
+    return wp.transform(
+        p=wp.vec3(
+            float(translation[0] if len(translation) > 0 else 0.0),
+            float(translation[1] if len(translation) > 1 else 0.0),
+            float(translation[2] if len(translation) > 2 else 0.0),
+        ),
+        q=wp.quat(
+            float(rotation[0] if len(rotation) > 0 else 0.0),
+            float(rotation[1] if len(rotation) > 1 else 0.0),
+            float(rotation[2] if len(rotation) > 2 else 0.0),
+            float(rotation[3] if len(rotation) > 3 else 1.0),
+        ),
+    )
+
+
+def _axis_from_values(values: list[Any] | tuple[Any, ...] | None) -> Any:
+    if not values:
+        return wp.vec3(1.0, 0.0, 0.0)
+
+    x = float(values[0] if len(values) > 0 else 1.0)
+    y = float(values[1] if len(values) > 1 else 0.0)
+    z = float(values[2] if len(values) > 2 else 0.0)
+    length = math.sqrt((x * x) + (y * y) + (z * z))
+    if length <= 1.0e-6:
+        return wp.vec3(1.0, 0.0, 0.0)
+    return wp.vec3(x / length, y / length, z / length)
+
+
+def _revolute_degrees_to_radians(value: float) -> float:
+    return math.radians(float(value))
+
+
 @dataclass
 class BodyState:
     body_id: int
@@ -85,12 +148,39 @@ class BodyState:
     newton_mesh: Any | None = None
 
 
+@dataclass
+class JointState:
+    joint_id: int
+    name: str
+    parent_body_id: int
+    child_body_id: int
+    joint_type: str
+    drive_mode: str
+    axis: tuple[float, float, float]
+    use_limits: bool
+    min_limit_degrees: float
+    max_limit_degrees: float
+    max_effort: float
+    target_angle_degrees: float
+    target_velocity_degrees_per_second: float
+    position_gain: float
+    damping_gain: float
+    feedforward_effort: float
+    parent_anchor_transform: dict[str, Any]
+    child_anchor_transform: dict[str, Any]
+    model_joint_index: int | None = None
+    dof_index: int | None = None
+    coord_index: int | None = None
+
+
 class BridgeWorld:
     def __init__(self, world_id: int, create_desc: dict[str, Any]) -> None:
         self.world_id = world_id
         self.create_desc = create_desc
         self.bodies: "OrderedDict[int, BodyState]" = OrderedDict()
         self.next_body_id = 1
+        self.joints: "OrderedDict[int, JointState]" = OrderedDict()
+        self.next_joint_id = 1
         self.scene_dirty = True
         self.sim_time_seconds = 0.0
         self.model = None
@@ -171,6 +261,85 @@ class BridgeWorld:
         hz = max(float(half_extents.get("z", 10.0)) * 0.01, 0.001)
         builder.add_shape_box(body_index, xform=shape_xform, hx=hx, hy=hy, hz=hz, cfg=shape_cfg)
 
+    def _joint_target_mode(self, joint: JointState) -> Any:
+        drive_mode = joint.drive_mode.lower()
+        if drive_mode == "position_control":
+            return (
+                newton.JointTargetMode.POSITION_VELOCITY
+                if joint.position_gain > 0.0 and joint.damping_gain > 0.0
+                else newton.JointTargetMode.POSITION
+            )
+        if drive_mode == "velocity_control":
+            return newton.JointTargetMode.VELOCITY
+        if drive_mode == "torque_control":
+            return newton.JointTargetMode.EFFORT
+        return newton.JointTargetMode.NONE
+
+    def _apply_joint_control_to_runtime(self, joint: JointState) -> None:
+        if self.control is None or joint.dof_index is None:
+            return
+
+        drive_mode = joint.drive_mode.lower()
+        dof_index = joint.dof_index
+
+        if self.control.joint_target_pos is not None:
+            target_pos = 0.0
+            if drive_mode in ("position_control", "velocity_control"):
+                target_pos = _revolute_degrees_to_radians(joint.target_angle_degrees) if joint.joint_type == "revolute" else float(joint.target_angle_degrees)
+            self.control.joint_target_pos.numpy()[dof_index] = target_pos
+
+        if self.control.joint_target_vel is not None:
+            target_vel = 0.0
+            if drive_mode in ("position_control", "velocity_control"):
+                target_vel = (
+                    _revolute_degrees_to_radians(joint.target_velocity_degrees_per_second)
+                    if joint.joint_type == "revolute"
+                    else float(joint.target_velocity_degrees_per_second)
+                )
+            self.control.joint_target_vel.numpy()[dof_index] = target_vel
+
+        if self.control.joint_act is not None:
+            self.control.joint_act.numpy()[dof_index] = float(joint.feedforward_effort)
+
+        if self.control.joint_f is not None:
+            self.control.joint_f.numpy()[dof_index] = float(joint.feedforward_effort if drive_mode == "torque_control" else 0.0)
+
+    def _apply_all_joint_controls_to_runtime(self) -> None:
+        if self.control is None:
+            return
+
+        for joint in self.joints.values():
+            self._apply_joint_control_to_runtime(joint)
+
+    def _sync_joint_states_from_state(self) -> list[dict[str, Any]]:
+        if self.state_0 is None or self.state_0.joint_q is None or self.state_0.joint_qd is None:
+            return []
+
+        joint_q = self.state_0.joint_q.numpy()
+        joint_qd = self.state_0.joint_qd.numpy()
+        result: list[dict[str, Any]] = []
+        for joint in self.joints.values():
+            position = 0.0
+            velocity = 0.0
+            if joint.coord_index is not None and joint.coord_index < len(joint_q):
+                position = float(joint_q[joint.coord_index])
+            if joint.dof_index is not None and joint.dof_index < len(joint_qd):
+                velocity = float(joint_qd[joint.dof_index])
+
+            if joint.joint_type == "revolute":
+                position = math.degrees(position)
+                velocity = math.degrees(velocity)
+
+            result.append(
+                {
+                    "joint_id": joint.joint_id,
+                    "name": joint.name,
+                    "position": position,
+                    "velocity": velocity,
+                }
+            )
+        return result
+
     def _rebuild_scene_if_needed(self) -> None:
         if not self.newton_available or not self.scene_dirty:
             return
@@ -197,8 +366,28 @@ class BridgeWorld:
             gravity=float(gravity_m[2]),
         )
 
+        articulated_body_ids: set[int] = set()
+        articulated_child_body_ids: set[int] = set()
+        for joint in self.joints.values():
+            if joint.parent_body_id > 0:
+                articulated_body_ids.add(joint.parent_body_id)
+            if joint.child_body_id > 0:
+                articulated_body_ids.add(joint.child_body_id)
+                articulated_child_body_ids.add(joint.child_body_id)
+
         for body in self.bodies.values():
             world_xform = _transform_to_newton(body.transform)
+            if body.body_id in articulated_body_ids:
+                body_index = builder.add_link(
+                    xform=world_xform,
+                    mass=0.0 if body.kinematic else max(float(body.mass_kg), 0.001),
+                    label=body.name or f"body_{body.body_id}",
+                    is_kinematic=bool(body.kinematic and body.body_id not in articulated_child_body_ids),
+                )
+                body.model_index = int(body_index)
+                self._add_shape(builder, int(body_index), body)
+                continue
+
             if body.kinematic:
                 body.model_index = None
                 self._add_shape(builder, -1, body, xform=world_xform)
@@ -211,6 +400,93 @@ class BridgeWorld:
             )
             body.model_index = int(body_index)
             self._add_shape(builder, int(body_index), body)
+
+        graph_neighbors: dict[int, set[int]] = {}
+        for joint in self.joints.values():
+            child_body = self.bodies.get(joint.child_body_id)
+            if child_body is None or child_body.model_index is None:
+                joint.model_joint_index = None
+                joint.dof_index = None
+                joint.coord_index = None
+                continue
+
+            parent_index = -1
+            if joint.parent_body_id > 0:
+                parent_body = self.bodies.get(joint.parent_body_id)
+                if parent_body is None or parent_body.model_index is None:
+                    joint.model_joint_index = None
+                    joint.dof_index = None
+                    joint.coord_index = None
+                    continue
+                parent_index = int(parent_body.model_index)
+
+            joint_kwargs: dict[str, Any] = {
+                "parent": parent_index,
+                "child": int(child_body.model_index),
+                "parent_xform": _export_transform_to_newton(joint.parent_anchor_transform),
+                "child_xform": _export_transform_to_newton(joint.child_anchor_transform),
+                "axis": _axis_from_values(joint.axis),
+                "label": joint.name,
+                "effort_limit": max(float(joint.max_effort), 0.0),
+                "target_ke": max(float(joint.position_gain), 0.0),
+                "target_kd": max(float(joint.damping_gain), 0.0),
+                "actuator_mode": self._joint_target_mode(joint),
+            }
+            if joint.use_limits:
+                joint_kwargs["limit_lower"] = _revolute_degrees_to_radians(joint.min_limit_degrees) if joint.joint_type == "revolute" else float(joint.min_limit_degrees)
+                joint_kwargs["limit_upper"] = _revolute_degrees_to_radians(joint.max_limit_degrees) if joint.joint_type == "revolute" else float(joint.max_limit_degrees)
+
+            if joint.joint_type == "fixed":
+                joint_index = builder.add_joint_fixed(
+                    parent=parent_index,
+                    child=int(child_body.model_index),
+                    parent_xform=_export_transform_to_newton(joint.parent_anchor_transform),
+                    child_xform=_export_transform_to_newton(joint.child_anchor_transform),
+                    label=joint.name,
+                )
+            elif joint.joint_type == "prismatic":
+                joint_index = builder.add_joint_prismatic(**joint_kwargs)
+            elif joint.joint_type == "spherical":
+                joint_index = builder.add_joint_ball(
+                    parent=parent_index,
+                    child=int(child_body.model_index),
+                    parent_xform=_export_transform_to_newton(joint.parent_anchor_transform),
+                    child_xform=_export_transform_to_newton(joint.child_anchor_transform),
+                    label=joint.name,
+                    actuator_mode=newton.JointTargetMode.NONE,
+                )
+            else:
+                joint_index = builder.add_joint_revolute(**joint_kwargs)
+
+            joint.model_joint_index = int(joint_index)
+            graph_neighbors.setdefault(joint.child_body_id, set())
+            if joint.parent_body_id > 0:
+                graph_neighbors.setdefault(joint.parent_body_id, set()).add(joint.child_body_id)
+                graph_neighbors[joint.child_body_id].add(joint.parent_body_id)
+
+        visited_bodies: set[int] = set()
+        for root_body_id in graph_neighbors:
+            if root_body_id in visited_bodies:
+                continue
+
+            stack = [root_body_id]
+            component_body_ids: set[int] = set()
+            while stack:
+                body_id = stack.pop()
+                if body_id in visited_bodies:
+                    continue
+                visited_bodies.add(body_id)
+                component_body_ids.add(body_id)
+                stack.extend(graph_neighbors.get(body_id, ()))
+
+            joint_indices = [
+                int(joint.model_joint_index)
+                for joint in self.joints.values()
+                if joint.model_joint_index is not None
+                and joint.child_body_id in component_body_ids
+            ]
+            if joint_indices:
+                builder.add_articulation(joint_indices)
 
         self.model = builder.finalize()
         self.collision_pipeline = newton.CollisionPipeline(
@@ -227,6 +503,20 @@ class BridgeWorld:
         self.state_1 = self.model.state()
         self.control = self.model.control()
         self.contacts = self.collision_pipeline.contacts()
+        for joint in self.joints.values():
+            if joint.model_joint_index is None:
+                joint.dof_index = None
+                joint.coord_index = None
+                continue
+
+            joint_index = int(joint.model_joint_index)
+            joint.coord_index = int(builder.joint_q_start[joint_index]) if joint_index < len(builder.joint_q_start) else None
+            next_dof_start = builder.joint_dof_count
+            if joint_index + 1 < len(builder.joint_qd_start):
+                next_dof_start = int(builder.joint_qd_start[joint_index + 1])
+            joint.dof_index = int(builder.joint_qd_start[joint_index]) if next_dof_start > int(builder.joint_qd_start[joint_index]) else None
+
+        self._apply_all_joint_controls_to_runtime()
         self.scene_dirty = False
 
     def _sync_body_transform_from_pose(self, body: BodyState, pose: Any) -> None:
@@ -257,6 +547,86 @@ class BridgeWorld:
                 continue
 
             self._sync_body_transform_from_pose(body, body_q[body.model_index])
+
+    def create_joint(self, params: dict[str, Any]) -> int:
+        joint_id = self.next_joint_id
+        self.next_joint_id += 1
+
+        axis_values = params.get("axis", [1.0, 0.0, 0.0])
+        self.joints[joint_id] = JointState(
+            joint_id=joint_id,
+            name=str(params.get("joint_name", f"joint_{joint_id}")),
+            parent_body_id=int(params.get("parent_body_id", 0)),
+            child_body_id=int(params.get("child_body_id", 0)),
+            joint_type=str(params.get("joint_type", "revolute")).lower(),
+            drive_mode=str(params.get("drive_mode", "passive")).lower(),
+            axis=(
+                float(axis_values[0] if len(axis_values) > 0 else 1.0),
+                float(axis_values[1] if len(axis_values) > 1 else 0.0),
+                float(axis_values[2] if len(axis_values) > 2 else 0.0),
+            ),
+            use_limits=bool(params.get("use_limits", False)),
+            min_limit_degrees=float(params.get("min_limit_degrees", -180.0)),
+            max_limit_degrees=float(params.get("max_limit_degrees", 180.0)),
+            max_effort=float(params.get("max_effort", 0.0)),
+            target_angle_degrees=float(params.get("target_angle_degrees", 0.0)),
+            target_velocity_degrees_per_second=float(params.get("target_velocity_degrees_per_second", 0.0)),
+            position_gain=float(params.get("position_gain", 0.0)),
+            damping_gain=float(params.get("damping_gain", 0.0)),
+            feedforward_effort=float(params.get("feedforward_effort", 0.0)),
+            parent_anchor_transform=dict(params.get("parent_anchor_transform", {})),
+            child_anchor_transform=dict(params.get("child_anchor_transform", {})),
+        )
+        self.scene_dirty = True
+        return joint_id
+
+    def destroy_joint(self, joint_id: int) -> None:
+        if joint_id in self.joints:
+            del self.joints[joint_id]
+            self.scene_dirty = True
+
+    def set_joint_controls(self, joint_controls: list[dict[str, Any]]) -> int:
+        updated_count = 0
+        joints_by_name = {joint.name: joint for joint in self.joints.values()}
+        for joint_control in joint_controls:
+            joint_name = str(joint_control.get("name", ""))
+            joint = joints_by_name.get(joint_name)
+            if joint is None:
+                continue
+
+            structural_change = False
+            if "drive_mode" in joint_control:
+                new_drive_mode = str(joint_control.get("drive_mode", joint.drive_mode)).lower()
+                structural_change = structural_change or new_drive_mode != joint.drive_mode
+                joint.drive_mode = new_drive_mode
+            if "target_angle_degrees" in joint_control:
+                joint.target_angle_degrees = float(joint_control.get("target_angle_degrees", joint.target_angle_degrees))
+            if "target_velocity_degrees_per_second" in joint_control:
+                joint.target_velocity_degrees_per_second = float(
+                    joint_control.get("target_velocity_degrees_per_second", joint.target_velocity_degrees_per_second)
+                )
+            if "position_gain" in joint_control:
+                new_position_gain = float(joint_control.get("position_gain", joint.position_gain))
+                structural_change = structural_change or not math.isclose(new_position_gain, joint.position_gain, rel_tol=1.0e-6, abs_tol=1.0e-6)
+                joint.position_gain = new_position_gain
+            if "damping_gain" in joint_control:
+                new_damping_gain = float(joint_control.get("damping_gain", joint.damping_gain))
+                structural_change = structural_change or not math.isclose(new_damping_gain, joint.damping_gain, rel_tol=1.0e-6, abs_tol=1.0e-6)
+                joint.damping_gain = new_damping_gain
+            if "feedforward_effort" in joint_control:
+                joint.feedforward_effort = float(joint_control.get("feedforward_effort", joint.feedforward_effort))
+            if "max_effort" in joint_control:
+                new_max_effort = float(joint_control.get("max_effort", joint.max_effort))
+                structural_change = structural_change or not math.isclose(new_max_effort, joint.max_effort, rel_tol=1.0e-6, abs_tol=1.0e-6)
+                joint.max_effort = new_max_effort
+
+            updated_count += 1
+            if structural_change:
+                self.scene_dirty = True
+            elif not self.scene_dirty:
+                self._apply_joint_control_to_runtime(joint)
+
+        return updated_count
 
     def create_body(self, params: dict[str, Any]) -> int:
         body_id = self.next_body_id
@@ -333,10 +703,14 @@ class BridgeWorld:
         result = {
             "simulated": True,
             "body_count": len(self.bodies),
+            "joint_count": len(self.joints),
             "sim_time_seconds": self.sim_time_seconds,
         }
         if body_transforms:
             result["body_transforms"] = body_transforms
+        joint_states = self._sync_joint_states_from_state()
+        if joint_states:
+            result["joint_states"] = joint_states
         return result
 
 
@@ -376,6 +750,14 @@ class BridgeServer:
         if method == "destroy_body":
             world.destroy_body(int(params.get("body_id", 0)))
             return {"destroyed": True}
+        if method == "create_joint":
+            return {"joint_id": world.create_joint(params)}
+        if method == "destroy_joint":
+            world.destroy_joint(int(params.get("joint_id", 0)))
+            return {"destroyed": True}
+        if method == "set_joint_controls":
+            joint_controls = [dict(value) for value in params.get("joints", [])]
+            return {"updated": world.set_joint_controls(joint_controls)}
         if method == "set_body_transform":
             return {"updated": world.set_body_transform(int(params.get("body_id", 0)), dict(params.get("transform", {})))}
         if method == "get_body_transform":
