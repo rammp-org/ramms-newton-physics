@@ -106,6 +106,44 @@ namespace
 		return nullptr;
 	}
 
+	// UGripperControllerComponent no longer exposes getters for its configuration
+	// (the arm/gripper integration is pending a RammsCore API rework). Until then,
+	// read the still-present protected UPROPERTY fields via reflection so the
+	// exported robot description keeps carrying the configured values.
+	template <typename TValue>
+	TValue GetGripperConfigValue(const UGripperControllerComponent& Gripper, const FName PropertyName, const TValue& DefaultValue)
+	{
+		const FProperty* Property = UGripperControllerComponent::StaticClass()->FindPropertyByName(PropertyName);
+		if (Property != nullptr && Property->GetSize() == sizeof(TValue))
+		{
+			return *Property->ContainerPtrToValuePtr<TValue>(&Gripper);
+		}
+		return DefaultValue;
+	}
+
+	FName GetGripperMeshComponentName(const UGripperControllerComponent& Gripper)
+	{
+		return GetGripperConfigValue<FName>(Gripper, TEXT("GripperMeshName"), NAME_None);
+	}
+
+	float GetGripperOpenAngle(const UGripperControllerComponent& Gripper)
+	{
+		return GetGripperConfigValue<float>(Gripper, TEXT("OpenAngle"), 0.0f);
+	}
+
+	float GetGripperClosedAngle(const UGripperControllerComponent& Gripper)
+	{
+		return GetGripperConfigValue<float>(Gripper, TEXT("ClosedAngle"), 0.0f);
+	}
+
+	TArray<FAngularMotorConfig> GetGripperFingerMotors(const UGripperControllerComponent& Gripper)
+	{
+		return {
+			GetGripperConfigValue<FAngularMotorConfig>(Gripper, TEXT("Finger1Motor"), FAngularMotorConfig()),
+			GetGripperConfigValue<FAngularMotorConfig>(Gripper, TEXT("Finger2Motor"), FAngularMotorConfig()),
+		};
+	}
+
 	FVector ToNewtonAxis(const EConstraintAxis Axis)
 	{
 		switch (Axis)
@@ -892,14 +930,11 @@ FString URammsNewtonArticulatedRobotComponent::GetEffectiveRobotExportJson() con
 		{
 			TSharedRef<FJsonObject> GripperJson = MakeShared<FJsonObject>();
 			GripperJson->SetStringField(TEXT("component_name"), GripperController->GetFName().ToString());
-			GripperJson->SetStringField(TEXT("skeletal_mesh_component_name"), GripperController->GetGripperSkeletalMeshComponentName().ToString());
-			GripperJson->SetNumberField(TEXT("open_angle_degrees"), GripperController->GetOpenAngle());
-			GripperJson->SetNumberField(TEXT("closed_angle_degrees"), GripperController->GetClosedAngle());
+			GripperJson->SetStringField(TEXT("skeletal_mesh_component_name"), GetGripperMeshComponentName(*GripperController).ToString());
+			GripperJson->SetNumberField(TEXT("open_angle_degrees"), GetGripperOpenAngle(*GripperController));
+			GripperJson->SetNumberField(TEXT("closed_angle_degrees"), GetGripperClosedAngle(*GripperController));
 
-			const TArray<FAngularMotorConfig> FingerMotors = {
-				GripperController->GetFinger1MotorConfig(),
-				GripperController->GetFinger2MotorConfig(),
-			};
+			const TArray<FAngularMotorConfig> FingerMotors = GetGripperFingerMotors(*GripperController);
 			TArray<TSharedPtr<FJsonValue>> FingerValues;
 			FingerValues.Reserve(FingerMotors.Num());
 			for (const FAngularMotorConfig& FingerMotor : FingerMotors)
@@ -996,10 +1031,7 @@ FString URammsNewtonArticulatedRobotComponent::GetCurrentJointControlJson() cons
 		if (const UGripperControllerComponent* GripperController =
 				FindNamedOrFirstComponent<UGripperControllerComponent>(Owner, GripperControllerComponentName))
 		{
-			const TArray<FAngularMotorConfig> FingerMotors = {
-				GripperController->GetFinger1MotorConfig(),
-				GripperController->GetFinger2MotorConfig(),
-			};
+			const TArray<FAngularMotorConfig> FingerMotors = GetGripperFingerMotors(*GripperController);
 
 			for (const FAngularMotorConfig& FingerMotor : FingerMotors)
 			{
@@ -1545,10 +1577,11 @@ void URammsNewtonArticulatedRobotComponent::AppendInferredRobotDescription(FRamm
 
 	if (GripperController)
 	{
+		const FName					  ConfiguredGripperMeshName = GetGripperMeshComponentName(*GripperController);
 		const USkeletalMeshComponent* GripperMeshComponent =
-			FindNamedOrFirstComponent<USkeletalMeshComponent>(Owner, GripperController->GetGripperSkeletalMeshComponentName());
+			FindNamedOrFirstComponent<USkeletalMeshComponent>(Owner, ConfiguredGripperMeshName);
 		const FName GripperMeshName = GripperMeshComponent ? GripperMeshComponent->GetFName()
-														   : ResolveSkeletalMeshName(Owner, GripperController->GetGripperSkeletalMeshComponentName());
+														   : ResolveSkeletalMeshName(Owner, ConfiguredGripperMeshName);
 		FName		ParentLinkName = EndEffectorLinkName != NAME_None ? EndEffectorLinkName : ArmRootLinkName;
 		if (ParentLinkName == NAME_None)
 		{
@@ -1563,12 +1596,11 @@ void URammsNewtonArticulatedRobotComponent::AppendInferredRobotDescription(FRamm
 			AddOrMergeLink(InOutDescription.Links, ParentLink);
 		}
 
-		const float						  MinFingerAngle = FMath::Min(GripperController->GetOpenAngle(), GripperController->GetClosedAngle());
-		const float						  MaxFingerAngle = FMath::Max(GripperController->GetOpenAngle(), GripperController->GetClosedAngle());
-		const TArray<FAngularMotorConfig> FingerMotors = {
-			GripperController->GetFinger1MotorConfig(),
-			GripperController->GetFinger2MotorConfig(),
-		};
+		const float						  GripperOpenAngle = GetGripperOpenAngle(*GripperController);
+		const float						  GripperClosedAngle = GetGripperClosedAngle(*GripperController);
+		const float						  MinFingerAngle = FMath::Min(GripperOpenAngle, GripperClosedAngle);
+		const float						  MaxFingerAngle = FMath::Max(GripperOpenAngle, GripperClosedAngle);
+		const TArray<FAngularMotorConfig> FingerMotors = GetGripperFingerMotors(*GripperController);
 
 		for (const FAngularMotorConfig& FingerMotor : FingerMotors)
 		{
