@@ -74,3 +74,6 @@ Plugins/**/Intermediate/*
 # Cache files for the editor to use
 DerivedDataCache/*
 __pycache__
+.venv
+__pycache__
+MUJOCO_LOG.TXT

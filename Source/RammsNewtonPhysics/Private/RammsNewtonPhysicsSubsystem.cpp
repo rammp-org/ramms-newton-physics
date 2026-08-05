@@ -1,185 +1,82 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright RAMMP. All Rights Reserved.
 
 #include "RammsNewtonPhysicsSubsystem.h"
 
-#include "RammsNewtonPhysicsComponent.h"
-#include "RammsNewtonPhysicsModule.h"
-#include "RammsNewtonPhysicsSettings.h"
+#include "Async/Async.h"
+#include "Misc/ScopeLock.h"
+#include "RammsNewtonWorkerClient.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogRammsNewtonPhysicsSubsystem, Log, All);
-
-void URammsNewtonPhysicsSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+FRammsNewtonCapabilities URammsNewtonPhysicsSubsystem::GetCachedCapabilities() const
 {
-	Super::Initialize(Collection);
-	RegisteredBridges.Reset();
-	AccumulatedTimeSeconds = 0.0f;
-	StepCounter = 0;
-	bAttemptedNativeBackendInit = false;
-	bLoggedUnavailable = false;
-	InitializeNativeBackendIfNeeded();
+	FScopeLock Lock(&CacheMutex);
+	return Cached;
 }
 
-void URammsNewtonPhysicsSubsystem::Deinitialize()
+bool URammsNewtonPhysicsSubsystem::IsNewtonAvailable() const
 {
-	for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
+	FScopeLock Lock(&CacheMutex);
+	return Cached.bProbed && Cached.bAvailable;
+}
+
+FRammsNewtonCapabilities URammsNewtonPhysicsSubsystem::ProbeAvailability(bool bForceReprobe)
+{
 	{
-		if (Bridge.IsValid())
+		FScopeLock Lock(&CacheMutex);
+		if (Cached.bProbed && !bForceReprobe)
 		{
-			NativeBackend.UnregisterBridge(*Bridge.Get());
+			return Cached;
 		}
 	}
-	NativeBackend.Shutdown();
-	RegisteredBridges.Reset();
-	Super::Deinitialize();
+	FRammsNewtonCapabilities Capabilities;
+	FRammsNewtonWorkerClient::RunProbe(Capabilities);
+	StoreCapabilities(Capabilities);
+	return Capabilities;
 }
 
-void URammsNewtonPhysicsSubsystem::Tick(float DeltaTime)
+void URammsNewtonPhysicsSubsystem::ProbeAvailabilityAsync(bool bForceReprobe)
 {
-	const URammsNewtonPhysicsSettings* Settings = GetDefault<URammsNewtonPhysicsSettings>();
-	if (!Settings || !Settings->bEnableSubsystemStepping)
+	if (bProbeInFlight)
 	{
 		return;
 	}
-
-	RegisteredBridges.RemoveAllSwap([](const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge) {
-		return !Bridge.IsValid();
-	});
-
-	if (RegisteredBridges.Num() == 0)
 	{
-		return;
-	}
-
-	const FRammsNewtonBackendStatus BackendStatus = GetBackendStatus();
-	if (!BackendStatus.bRuntimeReady)
-	{
-		if (Settings->bLogBackendWarnings && !bLoggedUnavailable)
+		FScopeLock Lock(&CacheMutex);
+		if (Cached.bProbed && !bForceReprobe)
 		{
-			bLoggedUnavailable = true;
-			UE_LOG(LogRammsNewtonPhysicsSubsystem, Warning, TEXT("%s"), *BackendStatus.Summary);
-		}
-		return;
-	}
-
-	InitializeNativeBackendIfNeeded();
-	if (!NativeBackend.IsInitialized())
-	{
-		return;
-	}
-
-	const float FixedStepSeconds = (Settings->FixedStepHz > KINDA_SMALL_NUMBER)
-		? (1.0f / Settings->FixedStepHz)
-		: (1.0f / 60.0f);
-
-	AccumulatedTimeSeconds += DeltaTime;
-	int32		Substeps = 0;
-	const int32 MaxSubsteps = FMath::Max(1, Settings->MaxSubstepsPerTick);
-	while (AccumulatedTimeSeconds >= FixedStepSeconds && Substeps < MaxSubsteps)
-	{
-		StepSimulation(FixedStepSeconds);
-		AccumulatedTimeSeconds -= FixedStepSeconds;
-		++Substeps;
-	}
-}
-
-TStatId URammsNewtonPhysicsSubsystem::GetStatId() const
-{
-	RETURN_QUICK_DECLARE_CYCLE_STAT(URammsNewtonPhysicsSubsystem, STATGROUP_Tickables);
-}
-
-void URammsNewtonPhysicsSubsystem::RegisterBridge(URammsNewtonPhysicsComponent* Bridge)
-{
-	if (Bridge)
-	{
-		RegisteredBridges.AddUnique(Bridge);
-		if (NativeBackend.IsInitialized())
-		{
-			NativeBackend.RegisterBridge(*Bridge);
-		}
-	}
-}
-
-void URammsNewtonPhysicsSubsystem::UnregisterBridge(URammsNewtonPhysicsComponent* Bridge)
-{
-	RegisteredBridges.RemoveAllSwap([Bridge](const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Candidate) {
-		return !Candidate.IsValid() || Candidate.Get() == Bridge;
-	});
-	if (Bridge)
-	{
-		NativeBackend.UnregisterBridge(*Bridge);
-	}
-}
-
-int32 URammsNewtonPhysicsSubsystem::GetRegisteredBridgeCount() const
-{
-	int32 Count = 0;
-	for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
-	{
-		if (Bridge.IsValid())
-		{
-			++Count;
-		}
-	}
-	return Count;
-}
-
-FRammsNewtonBackendStatus URammsNewtonPhysicsSubsystem::GetBackendStatus() const
-{
-	return FRammsNewtonPhysicsModule::Get().GetBackendStatus();
-}
-
-FRammsNewtonNativeWorldStatus URammsNewtonPhysicsSubsystem::GetNativeWorldStatus() const
-{
-	return NativeBackend.GetWorldStatus();
-}
-
-void URammsNewtonPhysicsSubsystem::InitializeNativeBackendIfNeeded()
-{
-	if (NativeBackend.IsInitialized())
-	{
-		return;
-	}
-	if (bAttemptedNativeBackendInit)
-	{
-		return;
-	}
-
-	const FRammsNewtonBackendStatus BackendStatus = GetBackendStatus();
-	if (!BackendStatus.bRuntimeReady)
-	{
-		return;
-	}
-
-	const URammsNewtonPhysicsSettings* Settings = GetDefault<URammsNewtonPhysicsSettings>();
-	if (!Settings)
-	{
-		return;
-	}
-
-	bAttemptedNativeBackendInit = true;
-	if (NativeBackend.Initialize(*Settings, BackendStatus))
-	{
-		for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
-		{
-			if (Bridge.IsValid())
-			{
-				NativeBackend.RegisterBridge(*Bridge.Get());
-			}
-		}
-	}
-}
-
-void URammsNewtonPhysicsSubsystem::StepSimulation(float FixedStepSeconds)
-{
-	NativeBackend.StepSimulation(FixedStepSeconds);
-
-	for (const TWeakObjectPtr<URammsNewtonPhysicsComponent>& Bridge : RegisteredBridges)
-	{
-		if (Bridge.IsValid())
-		{
-			Bridge->HandleSimulationStep(FixedStepSeconds);
+			OnProbeCompleted.Broadcast(Cached);
+			return;
 		}
 	}
 
-	++StepCounter;
+	bProbeInFlight = true;
+	TWeakObjectPtr<URammsNewtonPhysicsSubsystem> WeakThis(this);
+	Async(EAsyncExecution::ThreadPool,
+		[WeakThis]() {
+			FRammsNewtonCapabilities Capabilities;
+			FRammsNewtonWorkerClient::RunProbe(Capabilities);
+			AsyncTask(ENamedThreads::GameThread,
+				[WeakThis, Capabilities]() {
+					if (URammsNewtonPhysicsSubsystem* This = WeakThis.Get())
+					{
+						This->StoreCapabilities(Capabilities);
+						This->bProbeInFlight = false;
+						This->OnProbeCompleted.Broadcast(Capabilities);
+					}
+				});
+		});
+}
+
+void URammsNewtonPhysicsSubsystem::StoreCapabilities(const FRammsNewtonCapabilities& InCapabilities)
+{
+	FScopeLock Lock(&CacheMutex);
+	Cached = InCapabilities;
+	UE_LOG(LogRammsNewton, Log,
+		TEXT("Newton availability: %s (newton %s, cuda %s%s%s)"),
+		InCapabilities.bAvailable ? TEXT("AVAILABLE") : TEXT("unavailable"),
+		*InCapabilities.NewtonVersion,
+		InCapabilities.bCudaAvailable ? TEXT("yes: ") : TEXT("no"),
+		InCapabilities.bCudaAvailable ? *InCapabilities.CudaDeviceName : TEXT(""),
+		InCapabilities.Error.IsEmpty()
+			? TEXT("")
+			: *FString::Printf(TEXT(", error: %s"), *InCapabilities.Error));
 }

@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "0.1.0",
 	"FriendlyName": "RammsNewtonPhysics",
-	"Description": "Experimental RAMMS plugin for integrating Newton Dynamics as an external robotics physics backend for selected Unreal actors and components.",
+	"Description": "RAMMS plugin integrating the Newton physics engine (newton-physics/newton, GPU-accelerated via NVIDIA Warp) as an alternate solver behind UnrealRoboticsLab's MuJoCo data model. Newton runs out-of-process in a Python worker; this plugin provides the availability probe, ZMQ transport, and the custom step handler that swaps mj_step for Newton stepping.",
 	"Category": "Robotics & Simulation",
 	"CreatedBy": "RAMMP",
 	"CreatedByURL": "https://github.com/rammp-org",
@@ -17,6 +17,10 @@
 	"Plugins": [
 		{
 			"Name": "RammsCore",
+			"Enabled": true
+		},
+		{
+			"Name": "UnrealRoboticsLab",
 			"Enabled": true
 		}
 	],

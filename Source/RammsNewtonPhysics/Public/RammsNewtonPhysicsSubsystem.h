@@ -1,47 +1,58 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright RAMMP. All Rights Reserved.
 
 #pragma once
 
 #include "CoreMinimal.h"
-#include "RammsNewtonNativeBackend.h"
-#include "Subsystems/WorldSubsystem.h"
 #include "RammsNewtonPhysicsTypes.h"
+#include "Subsystems/EngineSubsystem.h"
 #include "RammsNewtonPhysicsSubsystem.generated.h"
 
-class URammsNewtonPhysicsComponent;
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+	FOnRammsNewtonProbeCompleted, const FRammsNewtonCapabilities&, Capabilities);
 
+/**
+ * App-wide Newton availability cache (probing spawns a Python subprocess and
+ * imports Newton, so results are cached for the session).
+ *
+ * Diagnostics/tooling surface only — URammsNewtonSolverComponent talks to
+ * the worker directly and does not depend on this subsystem.
+ */
 UCLASS()
-class RAMMSNEWTONPHYSICS_API URammsNewtonPhysicsSubsystem : public UTickableWorldSubsystem
+class RAMMSNEWTONPHYSICS_API URammsNewtonPhysicsSubsystem : public UEngineSubsystem
 {
 	GENERATED_BODY()
 
 public:
-	virtual void	Initialize(FSubsystemCollectionBase& Collection) override;
-	virtual void	Deinitialize() override;
-	virtual void	Tick(float DeltaTime) override;
-	virtual TStatId GetStatId() const override;
-	virtual bool	IsTickable() const override { return true; }
+	/** Cached result; unprobed default (bProbed=false) until a probe ran. */
+	UFUNCTION(BlueprintPure, Category = "RAMMS|Newton")
+	FRammsNewtonCapabilities GetCachedCapabilities() const;
 
-	void RegisterBridge(URammsNewtonPhysicsComponent* Bridge);
-	void UnregisterBridge(URammsNewtonPhysicsComponent* Bridge);
+	UFUNCTION(BlueprintPure, Category = "RAMMS|Newton")
+	bool IsNewtonAvailable() const;
 
-	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
-	int32 GetRegisteredBridgeCount() const;
+	/** True while a background probe is running. */
+	UFUNCTION(BlueprintPure, Category = "RAMMS|Newton")
+	bool IsProbing() const { return bProbeInFlight; }
 
-	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
-	FRammsNewtonBackendStatus GetBackendStatus() const;
+	/**
+	 * Probe on a background thread; OnProbeCompleted broadcasts on the game
+	 * thread when done. No-op if a probe is already in flight, or if a cached
+	 * result exists and bForceReprobe is false (the cache is broadcast).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "RAMMS|Newton")
+	void ProbeAvailabilityAsync(bool bForceReprobe = false);
 
-	UFUNCTION(BlueprintPure, Category = "Ramms|Physics|Newton")
-	FRammsNewtonNativeWorldStatus GetNativeWorldStatus() const;
+	/** Blocking probe (up to ProbeTimeoutSeconds) — prefer the async variant. */
+	UFUNCTION(BlueprintCallable, Category = "RAMMS|Newton")
+	FRammsNewtonCapabilities ProbeAvailability(bool bForceReprobe = false);
+
+	UPROPERTY(BlueprintAssignable, Category = "RAMMS|Newton")
+	FOnRammsNewtonProbeCompleted OnProbeCompleted;
 
 private:
-	void InitializeNativeBackendIfNeeded();
-	void StepSimulation(float FixedStepSeconds);
+	void StoreCapabilities(const FRammsNewtonCapabilities& InCapabilities);
 
-	TArray<TWeakObjectPtr<URammsNewtonPhysicsComponent>> RegisteredBridges;
-	FRammsNewtonNativeBackend							 NativeBackend;
-	float												 AccumulatedTimeSeconds = 0.0f;
-	int64												 StepCounter = 0;
-	bool												 bAttemptedNativeBackendInit = false;
-	bool												 bLoggedUnavailable = false;
+	mutable FCriticalSection CacheMutex;
+	FRammsNewtonCapabilities Cached;
+	bool					 bProbeInFlight = false;
 };
