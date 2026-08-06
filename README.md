@@ -1,257 +1,168 @@
 # ramms-newton-physics
 
-RAMMS plugin for UE5 which incorporates the Newton physics engine for robotic
-mobility and manipulation simulation inside Unreal Engine.
+RAMMS plugin integrating the **Newton physics engine**
+([newton-physics/newton](https://github.com/newton-physics/newton) — Python on
+NVIDIA Warp, primary solver MuJoCo-Warp; **not** Newton Dynamics) as an
+alternate solver **behind UnrealRoboticsLab's MuJoCo data model**. Newton has
+no C++ SDK, so it runs out-of-process in a Python worker; this plugin provides
+the worker, its transport, the availability probe, and the step-handler bridge
+that swaps URLab's `mj_step` for Newton stepping.
 
-## Current state
+Design of record: `doc/physics_backend_unification_plan.md` in the
+**ramms-sim** superproject (§5 is the concrete design this plugin implements).
+Worker internals: [`Scripts/README.md`](Scripts/README.md).
 
-This repository now contains an initial integration scaffold:
+## Architecture (one screen)
 
-- **`RammsNewtonPhysics.uplugin`** runtime plugin descriptor
-- **`RammsNewtonPhysicsThirdParty`** external module that detects:
-  - nested Newton source checkouts inside `ThirdParty/newton/`
-  - platform-specific prebuilt Newton libraries inside `ThirdParty/Prebuilt/`
-- **`URammsNewtonPhysicsSubsystem`** fixed-step world subsystem for hosting an
-  external Newton world
-- **`URammsNewtonPhysicsComponent`** actor bridge component for registering
-  selected UE actors/components with the Newton subsystem
-- **`URammsNewtonArticulatedRobotComponent`** explicit coupled-robot bridge for
-  mobile-base-plus-arm / gripper systems
-- **`URammsNewtonPhysicsSettings`** project settings for step rate, substeps,
-  gravity, warning behavior, and Python worker bridge configuration
-
-## Intended integration shape
-
-The plugin is aimed at **selective backend replacement**, not full-engine
-replacement. The goal is to let specific robots, wheelchairs, manipulators, or
-test rigs opt into Newton while the rest of the Unreal scene can continue to
-use native UE systems.
-
-For the RAMMS use case, the intended primary path is:
-
-- **Newton as the authoritative solver** for the mobile base, arm, gripper,
-  manipulated objects, and terrain interaction
-- **existing Unreal skeletal meshes** retained as the visual layer
-- **solver-side link/joint descriptions** used as the Newton articulation /
-  rigid-body representation
-- **pose synchronization** from Newton back into the UE components / bones each
-  fixed step
-
-### Near-term path
-
-1. Vendor Newton as a nested submodule or add prebuilt binaries.
-2. Extend `RammsNewtonPhysicsThirdParty.Build.cs` to compile or link the
-   backend on the target platforms you care about.
-3. Implement actor/component export into Newton rigid bodies, joints, and
-   articulated structures.
-4. Add state synchronization for:
-   - mobility bases (wheel bodies, caster arms, suspensions)
-   - manipulators (joint drives, limits, grippers)
-   - contact reporting and external force exchange
-
-## Third-party layout
-
-See [`ThirdParty/README.md`](ThirdParty/README.md) for the expected source and
-prebuilt SDK layout.
-
-### Current upstream checkout
-
-The repository now includes the nested submodule:
-
-```text
-ThirdParty/newton -> https://github.com/newton-physics/newton
+```
+UE game thread                URLab physics thread                Python worker (subprocess)
+──────────────                ────────────────────                ──────────────────────────
+URammsNewtonSolverComponent   per iteration (CallbackMutex held):  newton_worker package:
+  binds AAMjManager's           pre-step callbacks                  ZMQ REP, JSON/msgpack
+  UMjPhysicsEngine,             ApplyControls -> d->ctrl            ops: hello/load_model/
+  serializes compiled model     DrainCommands (mocap/wrench)             step/reset/shutdown
+  (mj_saveXMLString + VFS       CustomStepHandler  ────────────►    SolverMuJoCo (GPU) or
+  assets), load_model RPC,        fwd ctrl+mocap, step=1  ZMQ REQ   mujoco_cpu (portable)
+  installs CustomStepHandler      writeback qpos/qvel/act ◄──────   state returned in the
+                                  d->time += dt; mj_forward         ORIGINAL MJCF layout
+                                post-step callbacks, render pump
 ```
 
-This is the **newton-physics/newton** upstream selected for RAMMS. Note that it
-is a **Python/Warp-oriented Newton stack**, not a conventional native C/C++
-SDK drop-in. RAMMS now consumes that checkout through an **external Python worker
-bridge** rather than trying to bind it as a native UE library.
+Key properties:
 
-## Backend architecture
+- **Zero link-time Newton dependency.** The plugin compiles and loads on every
+  platform; Newton availability is a *runtime* property (probe + canary). The
+  only native deps (`mujoco.h`, `zmq.h`) come transitively from the `URLab`
+  module, which exports them publicly.
+- **Engine subprocess-only, always.** warp's native kernel compiler can
+  hard-crash or silently miscompile its host process — it must never run
+  inside the editor. Hence: out-of-process canary in the probe, liveness check
+  after every model load, per-step timeouts with poisoned-REQ-socket rebuild,
+  and graceful per-step fallback to local `mj_step` on any failure.
+- **Original-MJCF wire contract.** `SolverMuJoCo` internally re-exports the
+  model (prefixed names, dropped actuator names, possibly extra mocap bodies);
+  the worker maps state back into the **original** MJCF's qpos/qvel layout and
+  names, which is by construction URLab's own `mjData` layout.
+- **Every URLab consumer keeps working** (sensors, publishers, render pump,
+  debug viz): after writeback the bridge runs `mj_forward`, so all derived
+  quantities are consistent with Newton's state.
 
-The plugin now includes a first **in-process native backend host layer**:
+## Repository layout
 
-- `FRammsNewtonNativeBackend` — C++ runtime wrapper for a native Newton adapter
-- `URammsNewtonPhysicsSubsystem` — owns native world lifecycle and fixed-step stepping
-- `URammsNewtonPhysicsComponent` — tracks native registration state for managed primitive components
+| Path | What |
+|------|------|
+| `Source/RammsNewtonPhysics/` | Runtime module — `FRammsNewtonWorkerClient` (probe/spawn/ZMQ RPC), `URammsNewtonSolverComponent` (step-handler bridge + lifecycle), `URammsNewtonPhysicsSubsystem` (cached availability, BP surface), settings, types |
+| `Source/RammsNewtonPhysicsEditor/` | Editor module — Tools ▸ RAMMS Newton ▸ {Probe Availability, Validate Scene Under Newton, Export Compiled Scene} |
+| `Scripts/newton_worker/` | The Python worker package (protocol, ZMQ transport, `NewtonSim`, probe/canary CLI) + pytest suite |
+| `Scripts/.venv` | Pinned worker venv (untracked — recreate per machine, see below) |
+| `ThirdParty/newton` | Upstream newton checkout (installed editable into the venv); currently at tag **v1.4.0** |
+| `Scripts/ramms_newton_worker.py` | Previous-generation JSON-over-stdio worker — retired, kept only until nothing references it |
 
-The expected native adapter exports are currently:
+## Status (2026-08-05)
 
-- `RammsNewtonCreateWorld`
-- `RammsNewtonDestroyWorld`
-- `RammsNewtonStepWorld`
-- `RammsNewtonCreateBody`
-- `RammsNewtonDestroyBody`
-- `RammsNewtonSetBodyTransform`
-- `RammsNewtonGetBodyTransform`
+Milestones from plan §5.5:
 
-These are **RAMMS-side adapter exports**, not upstream Newton symbols.
+| Milestone | State |
+|-----------|-------|
+| **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 23-test pytest suite; UE client/settings/subsystem; probe + canary + liveness machinery |
+| **B** — CustomStepHandler end-to-end | **Implemented, NOT runtime-validated** (blocked on a warp-capable machine — see Known issues) |
+| **C** — lifecycle | **Core implemented** (reset detection/resync, restore refusal, mid-run attach policy, recompile rebind, crash fallback, PIE teardown). Open: worker `set_state`, replay-displacement detection |
+| **D** — editor tooling | **First cut done** (three menu actions). Open: toolbar status pill (worker alive / solver / achieved Hz), per-manager backend selector UX |
+| **E** — fleet mirror + gen3_2f85 grasp under Newton | Not started |
 
-The plugin now supports **three adapter paths**:
+Lifecycle semantics implemented in `URammsNewtonSolverComponent` (v1):
 
-1. **External Python worker bridge** — current path for the selected
-   `newton-physics/newton` checkout
-2. **External native adapter library** — future path if RAMMS also adopts a
-   native C/C++ Newton runtime
-3. **Built-in RAMMS adapter fallback** — in-process fallback that preserves the
-   registration/sync plumbing when neither external path is available
+- **Sim reset** (`d->time` → 0): handler steps locally while the worker resets
+  asynchronously (v1 reset = full model rebuild), then resumes. The few
+  locally-stepped frames cause a bounded divergence reconciled by the first
+  writeback.
+- **Snapshot restore** (mid-run time jump): deactivates cleanly — restoring an
+  arbitrary state into the worker needs the not-yet-implemented `set_state`.
+- **Mid-run activation**: the worker starts from the model's initial state, so
+  the component auto-resets the sim on attach (`bResetSimOnActivate`, default
+  on) or refuses.
+- **Mutual exclusion**: URLab's replay and Direct/Puppet RPC modes use the
+  same single `CustomStepHandler` slot — Newton requires Live mode and does
+  not yet detect being displaced.
 
-The built-in adapter is **not a real Newton solver**. It exists so the UE side
-can progress now while the real native adapter is still being defined.
+## Setting up on a new machine
 
-## External Python worker bridge
+Prerequisites: the superproject builds (in particular URLab's
+`third_party/build_all.ps1` / `setup_urlab.sh` has been run — that also
+provides the libzmq this plugin links), plus **Python 3.11+**.
 
-`FRammsNewtonNativeBackend` can now launch:
+1. **Create the worker venv** (from `Plugins/RammsNewtonPhysics/Scripts/`):
 
-```text
-Plugins/RammsNewtonPhysics/Scripts/ramms_newton_worker.py
-```
+   ```bash
+   python -m venv .venv
+   # Windows: .venv/Scripts/pip ; Unix: .venv/bin/pip
+   .venv/Scripts/pip install -e "../ThirdParty/newton[sim]" pyzmq msgpack pytest
+   ```
 
-That worker uses newline-delimited JSON over stdin/stdout, imports the vendored
-`ThirdParty/newton` checkout, and builds a Newton-side simulation world without
-depending on Unreal's editor-only embedded Python runtime.
+   This pulls warp-lang / mujoco / mujoco-warp at newton's pinned versions.
 
-This is the current recommended path for the selected upstream because it can be
-used in packaged builds as long as the deployment includes:
+2. **Verify the toolchain before trusting anything** (imports succeeding
+   proves nothing — warp compiles native kernels at first model load):
 
-1. a Python runtime accessible via `PythonExecutablePath` (or `python` on PATH)
-2. the worker script
-3. the Newton/Warp Python dependencies required by the vendored checkout
+   ```bash
+   .venv/Scripts/python -m newton_worker --probe          # env/JSON capability line
+   .venv/Scripts/python -m newton_worker canary --solver mujoco_cpu   # cold-cache CPU compile+step
+   .venv/Scripts/python -m newton_worker canary --solver mujoco       # same on CUDA
+   ```
 
-### Current bridge behavior
+   Both canaries must print `"ok": true`. First run compiles kernels (can take
+   minutes); subsequent runs are fast (warm cache).
 
-- Primitive components are exported as Newton bodies using:
-  - box shapes for `UBoxComponent`
-  - sphere shapes for `USphereComponent`
-  - capsule shapes for `UCapsuleComponent`
-  - triangle mesh export for `UStaticMeshComponent` by default when managed as static / kinematic
-  - convex hull export for `UStaticMeshComponent` by default when managed as dynamic
-  - AABB box fallback for other primitive components
-  - only components with `CollisionEnabled` set to `PhysicsOnly` or `QueryAndPhysics`
-- Bridge descriptions can now provide:
-  - a default collision geometry mode
-  - default material/contact parameters
-  - per-component geometry/material overrides keyed by component name
-- The `Restitution` material parameter now affects rigid-body contacts because the
-  worker enables XPBD restitution
-- The worker currently builds a body-level Newton world using
-  `newton.ModelBuilder`, `CollisionPipeline`, and `SolverXPBD`
-- If the worker cannot launch or import Newton, the plugin can fall back to the
-  built-in RAMMS adapter through project settings
+3. **Run the worker test suite**:
 
-### Current limitations
+   ```bash
+   .venv/Scripts/python -m pytest newton_worker/tests -q
+   ```
 
-- Python-worker articulation creation now exists for component-backed link bodies,
-  but native/built-in adapter paths are still body-only
-- No skeletal bone-level writeback yet
-- No scene/terrain export beyond the explicitly registered primitive components
-- Thin/open triangle meshes such as large plane meshes can still respond
-  differently from box-like floors with the same material values because their
-  contact geometry is not equivalent
-- The Python worker still rebuilds its scene when a body transform update is
-  sent, but the UE bridge now skips redundant transform pushes so unchanged
-  managed bodies no longer trigger that rebuild churn every fixed step
-- Arm/gripper inference that resolves to bones on a single skeletal mesh still
-  needs a later bone/body mapping slice before those inferred links can be
-  solved and written back as a true articulated manipulator in UE
+   Expected on a healthy machine: everything passes (GPU e2e tests read
+   `RAMMS_NEWTON_GPU_TESTS=1`). Tests that talk to the engine *skip* with a
+   precise reason when the toolchain is broken — skips are diagnostic, not
+   noise.
 
-## Articulated robot path
+4. **Build the editor** (`RammsEditor`) as usual. In the editor, run
+   **Tools ▸ RAMMS Newton ▸ Probe Newton Availability** — it should toast the
+   newton/python/CUDA versions. Settings live under
+   **Project Settings ▸ Plugins ▸ RAMMS Newton Physics** (python path
+   auto-locates `Scripts/.venv`; solver choice; timeouts; liveness toggle).
 
-`URammsNewtonArticulatedRobotComponent` is the first concrete RAMMS-oriented
-bridge API for Newton. It is intended to describe:
+5. **Use it**: place a `RammsNewtonSolverComponent` on any actor in a level
+   with an `AMjManager`, PIE, and watch the component status
+   (`GetStatusText()` / `LogRammsNewton`). It binds when the model compiles
+   and swaps stepping to the worker.
 
-- chassis / mobility-base links
-- wheel and caster joints
-- arm and gripper joints
-- optional manipulated-object links owned by the same Newton world
+## Known issues / machine notes
 
-This is the component to extend for a full coupled MeBot + Kinova + gripper
-simulation path.
+- **The original dev machine (i9-14900K) cannot compile warp kernels** —
+  degraded Raptor Lake silicon causes random native-compiler crashes
+  (0xC0000005/0xC0000409/0xC000001D) and occasional *silent miscompiles*
+  (loaded-but-frozen sims). This is a hardware defect, not a code issue; it is
+  why Milestone B/C runtime validation is pending. Details + upstream-report
+  material in `Scripts/README.md`. The probe/canary/liveness machinery exists
+  precisely to detect such environments and report "unavailable" instead of
+  crashing or lying.
+- warp 1.16's no-PCH CPU path is broken independently (deterministic NULL AV
+  on any kernel); keep precompiled headers at default.
+- `Scripts/README.md` documents the SolverMuJoCo re-export mapping and the
+  wire protocol.
 
-It can now build an **effective articulated robot description** by combining:
+## Pickup checklist (next work, in order)
 
-- explicit `RobotDescription` links/joints authored on the component
-- managed primitive components when `bAutoInferLinksFromManagedComponents` is enabled
-- `UKinovaGen3ControllerComponent` joint configuration when arm inference is enabled
-- `UGripperControllerComponent` finger motor configuration when gripper inference is enabled
-
-The inferred arm/gripper path is intended to provide a stable configuration
-layer for manipulation tasks before full solver-side bone writeback is
-implemented.
-
-Because full articulated Newton joint solve/writeback is not implemented yet,
-`URammsNewtonArticulatedRobotComponent` now defaults to **not**
-auto-registering with the Newton subsystem. This keeps it lightweight for:
-
-- controller-to-robot-description inference
-- validation
-- Newton USD export
-
-If you explicitly want to run it through the current live bridge, re-enable
-`bAutoRegisterWithSubsystem` on that component and keep the managed component
-set as small as possible. The articulated component now helps with that by
-defaulting its runtime managed-component set to the component-backed links from
-its authored robot description plus controller-derived arm/gripper inference
-instead of broadly registering all auto-collected primitives.
-
-When the Python worker bridge is active, the articulated component can now:
-
-- create Newton revolute / prismatic / fixed / spherical joints between the
-  registered component-backed bodies in its robot description
-- push live joint target exchange from Kinova/gripper controller targets into
-  the worker each fixed step
-- skip redundant body pose pushes for those articulated bridges so joint-driven
-  simulation is not constantly invalidated by scene rebuild churn
-
-This first runtime articulation slice is best suited to robots authored with
-distinct primitive/static-mesh link components. Inferred bone links on a single
-skeletal mesh are not solver-written back yet.
-
-## Newton USD export
-
-The plugin now includes a first **Newton-compatible robotics USD export path**
-for articulated robots:
-
-- `URammsNewtonArticulatedRobotComponent::GetEffectiveRobotExportJson()` serializes:
-  - the effective inferred link/joint topology
-  - current actor/link transforms
-  - primitive collision metadata for simple UE components
-  - Kinova and gripper controller actuator settings needed for Newton actuator prims
-- `Content/Python/ramms_newton_usd.py` converts that JSON into a USD stage using
-  `UsdPhysics` plus `newton-usd-schemas`
-- `Content/Python/ramms_newton_usd_exporter.py` provides Unreal Editor helpers:
-  - `export_actor_to_newton_usd(actor, output_path, component_name="")`
-  - `export_selected_actors_to_newton_usd(output_directory)`
-
-The exported stage currently includes:
-
-- a `UsdPhysics.Scene` with `NewtonSceneAPI` and `NewtonXpbdSceneAPI`
-- a `Geometry` hierarchy of articulated links
-- `PhysicsRigidBodyAPI` / `MassAPI` on exported links
-- `NewtonArticulationRootAPI` on the first root link
-- `UsdPhysics` joints under `Physics`
-- `NewtonActuator` prims for non-passive joints
-- simple collision geometry for box / sphere / capsule links
-- a default Newton physics material
-
-### Current exporter limitations
-
-- Skeletal links are exported as articulated Xforms with source metadata, but
-  their rendered meshes and collision shapes are not yet converted into robotics
-  USD geometry assets.
-- Static mesh links currently preserve mesh/material source metadata rather than
-  exporting referenced mesh payloads.
-- The exporter targets the newer `NewtonActuator` / `newton:*` schema naming in
-  `newton-usd-schemas`; the current `newton-actuators` USD parser still appears
-  to expect the older legacy `Actuator` / `newton:actuator:*` names.
-
-### Python dependency note
-
-The export scripts assume the Newton plugin venv has the USD runtime installed.
-The working setup used here was:
-
-```powershell
-Plugins\RammsNewtonPhysics\ThirdParty\newton\.venv\Scripts\python.exe -m ensurepip --upgrade
-Plugins\RammsNewtonPhysics\ThirdParty\newton\.venv\Scripts\python.exe -m pip install usd-exchange
-Plugins\RammsNewtonPhysics\ThirdParty\newton\.venv\Scripts\python.exe -m pip install -e C:\Users\waemf\data\newton-usd-schemas
-```
+1. On a warp-capable machine: run the setup above, then **validate Milestone
+   B/C at runtime** — PIE with a solver component on a URLab scene (start with
+   a MuJoCo Menagerie arm), confirm Newton stepping activates, reset/rebind
+   behave, and record a qpos-trace parity run (same ctrl trajectory under
+   `mj_step` vs Newton) as the acceptance artifact.
+2. Worker `set_state` (protocol op exists, returns not_implemented) — unlocks
+   snapshot restore and divergence-free reset/attach. Needs engine-side state
+   injection semantics validated against SolverMuJoCo internals.
+3. Milestone D remainder: toolbar status pill, backend selector.
+4. Milestone E: `ramms_newton_fleet_mirror.py` (URLab Puppet-mode viewer for
+   multi-env fleets) + gen3_2f85 grasp test under Newton.
+5. Upstream: file the warp compiler bug report (repro + evidence in
+   `Scripts/README.md`); candidates for URLab PRs: `OnModelCompiled` delegate,
+   step-handler arbitration.
