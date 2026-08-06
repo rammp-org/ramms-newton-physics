@@ -29,6 +29,11 @@
 			"Name": "RammsNewtonPhysics",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RammsNewtonPhysicsEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }

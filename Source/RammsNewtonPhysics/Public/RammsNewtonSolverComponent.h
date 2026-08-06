@@ -48,6 +48,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")
 	bool bActivateOnBeginPlay = true;
 
+	/**
+	 * If the sim already advanced past its initial state when the worker
+	 * finishes loading, reset the simulation so both sides start aligned at
+	 * t=0. When false, activation is refused instead (the worker can only
+	 * start from the model's initial state until set_state lands).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")
+	bool bResetSimOnActivate = true;
+
 	/** Begin (or retry) taking over stepping. Loads happen asynchronously. */
 	UFUNCTION(BlueprintCallable, Category = "Newton")
 	void ActivateNewtonSolver();
@@ -66,6 +75,20 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Newton")
 	FRammsNewtonModelInfo GetModelInfo() const { return ModelInfo; }
 
+	/**
+	 * Serialize the engine's compiled model (mj_saveXMLString on the live
+	 * mjSpec, asset references flattened to bare filenames) plus the VFS
+	 * asset blobs — the exact payload the worker's load_model expects and the
+	 * scene-export artifact for headless training (plan §5.4). Takes the
+	 * engine's CallbackMutex briefly. Also used by the editor module
+	 * (validate / export actions).
+	 */
+	static bool SerializeCompiledModel(
+		UMjPhysicsEngine*			  Engine,
+		FString&					  OutXml,
+		TMap<FString, TArray<uint8>>& OutAssets,
+		FString&					  OutError);
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -78,12 +101,6 @@ private:
 	void			  InstallHandler(UMjPhysicsEngine* Engine);
 	void			  UninstallHandler();
 	void			  SetStatus(const FString& InStatus);
-
-	static bool SerializeCompiledModel(
-		UMjPhysicsEngine*			  Engine,
-		FString&					  OutXml,
-		TMap<FString, TArray<uint8>>& OutAssets,
-		FString&					  OutError);
 
 	/** Worker connection; shared so background load/teardown tasks can outlive the component. */
 	TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> Client;
@@ -98,6 +115,28 @@ private:
 
 	/** Forward d->mocap_* each step; auto-disabled if the worker rejects it. */
 	std::atomic<bool> bForwardMocap{ true };
+
+	/**
+	 * Lifecycle resync requests raised by the step handler when it observes a
+	 * time discontinuity in mjData (see TickComponent for servicing).
+	 */
+	enum class EResyncRequest : uint8
+	{
+		None = 0,
+		/** d->time snapped to ~0: URLab reset — mirror it with a worker reset. */
+		Reset = 1,
+		/** d->time jumped mid-run: snapshot restore — unsupported until worker set_state. */
+		Unsupported = 2,
+	};
+	std::atomic<uint8> PendingResync{ 0 };
+	bool			   bResyncInFlight = false;
+
+	/**
+	 * d->time as of our last writeback (physics thread). -1 = no step yet.
+	 * The handler compares mjData's time against this to detect resets and
+	 * restores that happened between our steps.
+	 */
+	std::atomic<double> LastSteppedTime{ -1.0 };
 
 	bool bWantActive = false;
 	bool bHandlerInstalled = false;

@@ -59,6 +59,9 @@ void URammsNewtonSolverComponent::DeactivateNewtonSolver()
 		Async(EAsyncExecution::ThreadPool, [Retired]() { Retired->Stop(); });
 	}
 	bLoadInFlight = false;
+	bResyncInFlight = false;
+	PendingResync.store(static_cast<uint8>(EResyncRequest::None));
+	LastSteppedTime.store(-1.0);
 	SetStatus(TEXT("Inactive (URLab stepping locally)"));
 }
 
@@ -131,6 +134,71 @@ void URammsNewtonSolverComponent::TickComponent(
 	if (Manager && Manager->EffectiveStepMode.load() != EStepMode::Live)
 	{
 		SetStatus(TEXT("Manager is in Direct/Puppet step mode — Newton requires Live mode"));
+		return;
+	}
+
+	// Service lifecycle resyncs raised by the step handler. While a resync is
+	// pending or in flight, the handler steps locally (mj_step) so the sim
+	// keeps running; the worker rejoins once its state is aligned again.
+	const EResyncRequest Resync = static_cast<EResyncRequest>(PendingResync.load());
+	if (bHandlerInstalled && Resync != EResyncRequest::None && !bResyncInFlight)
+	{
+		if (Resync == EResyncRequest::Unsupported)
+		{
+			UE_LOG(LogRammsNewton, Warning,
+				TEXT("[NewtonSolver] Snapshot restore detected — not supported under Newton yet (needs worker set_state). Falling back to local stepping."));
+			DeactivateNewtonSolver();
+			bWantActive = false;
+			SetStatus(TEXT("Deactivated: snapshot restore requires worker set_state (URLab stepping locally)"));
+			return;
+		}
+
+		// Simulation reset: mirror it in the worker (v1 reset = full model
+		// rebuild — slow-ish cold, seconds warm), then let the handler resume.
+		// The few locally-stepped frames in between cause a bounded, tiny
+		// divergence that the first writeback reconciles.
+		bResyncInFlight = true;
+		SetStatus(TEXT("Sim reset — resetting Newton worker"));
+		TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> LocalClient = Client;
+		TWeakObjectPtr<URammsNewtonSolverComponent>				  WeakThis(this);
+		Async(EAsyncExecution::ThreadPool,
+			[LocalClient, WeakThis]() {
+				FRammsNewtonStepResult Unused;
+				FString				   Error;
+				const bool			   bOk = LocalClient->ResetSim(Unused, Error);
+				AsyncTask(ENamedThreads::GameThread,
+					[WeakThis, bOk, Error]() {
+						URammsNewtonSolverComponent* This = WeakThis.Get();
+						if (!This)
+						{
+							return;
+						}
+						This->bResyncInFlight = false;
+						if (!This->bWantActive || !This->bHandlerInstalled)
+						{
+							return;
+						}
+						if (!bOk)
+						{
+							This->SetStatus(FString::Printf(TEXT("Worker reset failed: %s"), *Error));
+							This->bStepFailed.store(true); // next Tick falls back cleanly
+							return;
+						}
+						// Re-arm the handler at the engine's current time so the
+						// discontinuity check doesn't re-trigger on the local
+						// steps taken while the worker was rebuilding.
+						if (UMjPhysicsEngine* BoundEnginePtr = This->BoundEngine.Get())
+						{
+							FScopeLock Lock(&BoundEnginePtr->CallbackMutex);
+							if (mjData* Data = BoundEnginePtr->GetData())
+							{
+								This->LastSteppedTime.store(Data->time);
+							}
+						}
+						This->PendingResync.store(static_cast<uint8>(EResyncRequest::None));
+						This->SetStatus(TEXT("Newton stepping active (resynced after sim reset)"));
+					});
+			});
 		return;
 	}
 
@@ -378,18 +446,64 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 
 void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 {
+	// The worker starts from the model's initial state, so the engine must be
+	// there too or the first writeback would visibly snap the sim backwards.
+	double EngineTime = 0.0;
+	{
+		FScopeLock Lock(&Engine->CallbackMutex);
+		if (mjData* Data = Engine->GetData())
+		{
+			EngineTime = Data->time;
+		}
+	}
+	if (EngineTime > UE_KINDA_SMALL_NUMBER)
+	{
+		if (bResetSimOnActivate)
+		{
+			UE_LOG(LogRammsNewton, Log,
+				TEXT("[NewtonSolver] Sim advanced to t=%.3fs during worker load — resetting so Newton takes over from the initial state"),
+				EngineTime);
+			Engine->ResetSimulation();
+		}
+		else
+		{
+			SetStatus(FString::Printf(
+				TEXT("Refusing to attach at t=%.3fs (bResetSimOnActivate is off; Newton can only start from the initial state until set_state lands)"),
+				EngineTime));
+			bWantActive = false;
+			return;
+		}
+	}
+
 	BoundEngine = Engine;
 	ExpectedModel.store(Engine->GetModel());
 	bStepFailed.store(false);
 	bForwardMocap.store(true);
+	PendingResync.store(static_cast<uint8>(EResyncRequest::None));
+	LastSteppedTime.store(-1.0);
 
 	// Runs on URLab's physics thread, inside CallbackMutex. It must never
 	// call back into Set/ClearCustomStepHandler (self-deadlock) — failures
 	// raise bStepFailed and Tick services them on the game thread.
 	Engine->SetCustomStepHandler(
 		[this](mjModel* Model, mjData* Data) {
-			if (Model != ExpectedModel.load() || bStepFailed.load() || !Client.IsValid())
+			if (Model != ExpectedModel.load() || bStepFailed.load() || !Client.IsValid()
+				|| PendingResync.load() != static_cast<uint8>(EResyncRequest::None))
 			{
+				mj_step(Model, Data);
+				return;
+			}
+
+			// Detect external time changes since our last writeback: a reset
+			// (time back to ~0) or a snapshot restore (arbitrary jump). URLab
+			// applies both inside this same physics iteration before the step
+			// handler runs, so mjData is already in the new state here.
+			const double Prev = LastSteppedTime.load();
+			if (Prev >= 0.0 && !FMath::IsNearlyEqual(Data->time, Prev, Model->opt.timestep * 0.5))
+			{
+				const bool bIsReset = Data->time < Model->opt.timestep * 0.5;
+				PendingResync.store(static_cast<uint8>(
+					bIsReset ? EResyncRequest::Reset : EResyncRequest::Unsupported));
 				mj_step(Model, Data);
 				return;
 			}
@@ -445,6 +559,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 				FMemory::Memcpy(Data->act, Result.Act.GetData(), Model->na * sizeof(double));
 			}
 			Data->time += Model->opt.timestep;
+			LastSteppedTime.store(Data->time);
 
 			// Recompute all derived quantities (sites, sensors, contacts) at
 			// Newton's state so URLab's sensors/publishers stay consistent.
