@@ -1,0 +1,50 @@
+{
+  "kind": "ramms_newton_qpos_parity",
+  "model": "gen3_2f85.xml",
+  "model_path": "C:\\Users\\waemf\\data\\ramms\\mujoco\\gen3_2f85\\gen3_2f85.xml",
+  "solver": "mujoco_cpu",
+  "fix_base": true,
+  "removed_free_joints": 1,
+  "no_contact": false,
+  "timestep": 0.002,
+  "sim_seconds": 4.0,
+  "model_info": {
+    "nq": 15,
+    "nv": 15,
+    "nu": 8,
+    "nbody": 24
+  },
+  "versions": {
+    "mujoco": "3.11.0",
+    "newton": "1.5.0rc2",
+    "warp": "1.16.0",
+    "python": "3.12.10"
+  },
+  "tolerance": 0.1,
+  "metrics": {
+    "steps": 2000,
+    "nq": 15,
+    "max_abs_error": 0.5181283532214771,
+    "final_max_abs_error": 0.4454393203586831,
+    "rmse": 0.07655297435162794,
+    "worst_dof": 0,
+    "per_dof_max_error": [
+      0.5181283532214771,
+      0.001859878757705602,
+      0.0018936080333733507,
+      0.000900627758692929,
+      0.0011085472551903425,
+      0.000691809415236555,
+      2.7809382274313066e-05,
+      6.544675373032494e-06,
+      0.0001400124634059162,
+      0.0001222471606915354,
+      0.00023235282151773395,
+      8.08389787965158e-06,
+      0.00012552367991092378,
+      6.885117902577509e-05,
+      0.00032286744350357166
+    ]
+  },
+  "passed": false
+}

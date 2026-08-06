@@ -55,17 +55,17 @@ Key properties:
 | `Source/RammsNewtonPhysicsEditor/` | Editor module — Tools ▸ RAMMS Newton ▸ {Probe Availability, Validate Scene Under Newton, Export Compiled Scene} |
 | `Scripts/newton_worker/` | The Python worker package (protocol, ZMQ transport, `NewtonSim`, probe/canary CLI) + pytest suite |
 | `Scripts/.venv` | Pinned worker venv (untracked — recreate per machine, see below) |
-| `ThirdParty/newton` | Upstream newton checkout (installed editable into the venv); currently at tag **v1.4.0** |
+| `ThirdParty/newton` | Upstream newton checkout (installed editable into the venv); currently at tag **v1.5.0rc2** (pins mujoco / mujoco-warp 3.11 — required for GPU mesh collision on Blackwell/sm_120) |
 | `Scripts/ramms_newton_worker.py` | Previous-generation JSON-over-stdio worker — retired, kept only until nothing references it |
 
-## Status (2026-08-05)
+## Status (2026-08-06)
 
 Milestones from plan §5.5:
 
 | Milestone | State |
 |-----------|-------|
-| **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 23-test pytest suite; UE client/settings/subsystem; probe + canary + liveness machinery |
-| **B** — CustomStepHandler end-to-end | **Implemented, NOT runtime-validated** (blocked on a warp-capable machine — see Known issues) |
+| **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 27-test pytest suite; UE client/settings/subsystem; probe + canary (now liveness-checking) + liveness machinery |
+| **B** — CustomStepHandler end-to-end | **Worker side runtime-validated** on a healthy machine (Threadripper 9960X / RTX 5090): qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU). Contact-regime parity blocked on Newton's contact-set translation (see Known issues). **UE PIE validation still open** |
 | **C** — lifecycle | **Core implemented** (reset detection/resync, restore refusal, mid-run attach policy, recompile rebind, crash fallback, PIE teardown). Open: worker `set_state`, replay-displacement detection |
 | **D** — editor tooling | **First cut done** (three menu actions). Open: toolbar status pill (worker alive / solver / achieved Hz), per-manager backend selector UX |
 | **E** — fleet mirror + gen3_2f85 grasp under Newton | Not started |
@@ -96,10 +96,13 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
    ```bash
    python -m venv .venv
    # Windows: .venv/Scripts/pip ; Unix: .venv/bin/pip
-   .venv/Scripts/pip install -e "../ThirdParty/newton[sim]" pyzmq msgpack pytest
+   .venv/Scripts/pip install -e "../ThirdParty/newton[sim]" trimesh pyzmq msgpack pytest
    ```
 
    This pulls warp-lang / mujoco / mujoco-warp at newton's pinned versions.
+   `trimesh` (STL mesh loading) is deliberately installed alone rather than
+   via newton's `importers` extra — that extra's transitive deps exceed
+   Windows MAX_PATH during install.
 
 2. **Verify the toolchain before trusting anything** (imports succeeding
    proves nothing — warp compiles native kernels at first model load):
@@ -137,6 +140,24 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
 
 ## Known issues / machine notes
 
+- **Blackwell (sm_120, e.g. RTX 5090) GPU mesh collision requires
+  mujoco-warp ≥ 3.11**: 3.10.x's mesh CCD kernel faults with CUDA error 700
+  (deterministic; not cache/stack related). This is why `ThirdParty/newton`
+  was bumped to v1.5.0rc2 on 2026-08-06 (mujoco 3.10 → 3.11). Note the
+  worker now compiles its reference model with mujoco 3.11 while URLab's
+  UE-side MuJoCo stays at its own version — the wire contract is
+  qpos/qvel/act in the original MJCF's layout, which is topology-determined
+  and version-stable, but watch for MJCF-compiler default changes when
+  either side moves again.
+- **Newton's contact-set translation diverges from the original model**
+  (nexclude/contype/conaffinity/condim rewritten by the importer +
+  re-export). Contact-free parity is ~1e-4; contact-regime parity is
+  ~0.5 rad on gen3_2f85. Upstream issue to file; Milestone E grasping
+  depends on it. Details + all parity numbers: `Scripts/README.md`.
+- **Author explicit `<inertial>` for every body and two-value `solref*`
+  attributes** in robot MJCFs — newton's importer disagrees with MuJoCo
+  about geom-derived inertials (visual geoms) and mis-parses single-value
+  solref as `[t, 0]`. Both bit us on gen3_2f85 (fixed in `mujoco/gen3_2f85/`).
 - **The original dev machine (i9-14900K) cannot compile warp kernels** —
   degraded Raptor Lake silicon causes random native-compiler crashes
   (0xC0000005/0xC0000409/0xC000001D) and occasional *silent miscompiles*
@@ -152,17 +173,20 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
 
 ## Pickup checklist (next work, in order)
 
-1. On a warp-capable machine: run the setup above, then **validate Milestone
-   B/C at runtime** — PIE with a solver component on a URLab scene (start with
-   a MuJoCo Menagerie arm), confirm Newton stepping activates, reset/rebind
-   behave, and record a qpos-trace parity run (same ctrl trajectory under
-   `mj_step` vs Newton) as the acceptance artifact.
+1. **Validate Milestone B/C in PIE** — solver component on a URLab scene,
+   confirm Newton stepping activates, reset/rebind behave. The worker-side
+   half of B is done (parity harness + artifacts, 2026-08-06; newton bumped
+   to v1.5.0rc2 the same day, so the GPU solver covers mesh robots).
 2. Worker `set_state` (protocol op exists, returns not_implemented) — unlocks
    snapshot restore and divergence-free reset/attach. Needs engine-side state
    injection semantics validated against SolverMuJoCo internals.
 3. Milestone D remainder: toolbar status pill, backend selector.
 4. Milestone E: `ramms_newton_fleet_mirror.py` (URLab Puppet-mode viewer for
-   multi-env fleets) + gen3_2f85 grasp test under Newton.
-5. Upstream: file the warp compiler bug report (repro + evidence in
-   `Scripts/README.md`); candidates for URLab PRs: `OnModelCompiled` delegate,
-   step-handler arbitration.
+   multi-env fleets) + gen3_2f85 grasp test under Newton — gated on the
+   contact-translation issue (Known issues).
+5. Upstream: file (a) the mujoco-warp sm_120 mesh-CCD crash (fixed in 3.11,
+   affects 3.10.x users), (b) newton importer single-value `solreflimit`
+   mis-parse, (c) newton contact-set translation divergence, (d) the warp
+   compiler bug report from the old machine (repro in `Scripts/README.md`);
+   candidates for URLab PRs: `OnModelCompiled` delegate, step-handler
+   arbitration.

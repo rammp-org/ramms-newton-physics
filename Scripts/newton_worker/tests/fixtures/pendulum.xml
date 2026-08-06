@@ -1,0 +1,15 @@
+<!-- Canonical parity fixture: 1-DOF position-actuated pendulum.
+     Used by test_parity.py; run by hand via the "parity" subcommand of
+     newton_worker with this file as the model. -->
+<mujoco model="test_pendulum">
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <worldbody>
+    <body name="pole" pos="0 0 1">
+      <joint name="hinge" type="hinge" axis="0 1 0" damping="0.5"/>
+      <geom name="rod" type="capsule" fromto="0 0 0  0.4 0 0" size="0.02" density="1000"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="hinge_pos" joint="hinge" kp="60" kv="8" ctrlrange="-1.5 1.5"/>
+  </actuator>
+</mujoco>

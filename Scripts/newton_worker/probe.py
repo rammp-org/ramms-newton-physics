@@ -77,6 +77,12 @@ def run_canary(solver: str = "mujoco", timeout_seconds: float = 300.0) -> dict[s
         return {"ok": False, "solver": solver, "error": f"{type(exc).__name__}: {exc}"}
     if proc.returncode == 0 and "CANARY_OK" in proc.stdout:
         return {"ok": True, "solver": solver, "error": None}
+    if "CANARY_DEAD" in proc.stdout:
+        return {
+            "ok": False,
+            "solver": solver,
+            "error": "engine loaded but produced a frozen simulation (miscompile signature)",
+        }
     tail = (proc.stderr.strip() or proc.stdout.strip()).splitlines()[-4:]
     return {
         "ok": False,

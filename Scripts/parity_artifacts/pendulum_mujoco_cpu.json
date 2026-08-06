@@ -1,0 +1,36 @@
+{
+  "kind": "ramms_newton_qpos_parity",
+  "model": "pendulum.xml",
+  "model_path": "C:\\Users\\waemf\\data\\ramms\\Plugins\\RammsNewtonPhysics\\Scripts\\newton_worker\\tests\\fixtures\\pendulum.xml",
+  "solver": "mujoco_cpu",
+  "fix_base": false,
+  "removed_free_joints": 0,
+  "no_contact": false,
+  "timestep": 0.002,
+  "sim_seconds": 4.0,
+  "model_info": {
+    "nq": 1,
+    "nv": 1,
+    "nu": 1,
+    "nbody": 2
+  },
+  "versions": {
+    "mujoco": "3.11.0",
+    "newton": "1.5.0rc2",
+    "warp": "1.16.0",
+    "python": "3.12.10"
+  },
+  "tolerance": 0.1,
+  "metrics": {
+    "steps": 2000,
+    "nq": 1,
+    "max_abs_error": 0.0005834720225776635,
+    "final_max_abs_error": 0.0002492010093497754,
+    "rmse": 0.00023058827084184317,
+    "worst_dof": 0,
+    "per_dof_max_error": [
+      0.0005834720225776635
+    ]
+  },
+  "passed": true
+}

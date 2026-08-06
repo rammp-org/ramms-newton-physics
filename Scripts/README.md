@@ -12,8 +12,12 @@ side can write them straight back into URLab's `mjData`.
 ```powershell
 cd Plugins/RammsNewtonPhysics/Scripts
 python -m venv .venv
-.venv/Scripts/python -m pip install -e "../ThirdParty/newton[sim]" pyzmq pytest msgpack
+.venv/Scripts/python -m pip install -e "../ThirdParty/newton[sim]" trimesh pyzmq pytest msgpack
 ```
+
+`trimesh` is required to load MJCF mesh assets (STL); it lives in newton's
+`importers` extra, but installing that whole extra drags in packages whose
+paths exceed Windows' MAX_PATH — install `trimesh` alone instead.
 
 ## Usage
 
@@ -23,12 +27,26 @@ python -m venv .venv
 
 # Canary: load+step a tiny model in a THROWAWAY SUBPROCESS; JSON verdict.
 # This is the real availability check — package imports succeeding does not
-# prove the native toolchain can compile kernels without crashing.
+# prove the native toolchain can compile kernels without crashing. The
+# canary also verifies LIVENESS (gravity must move the rod): a loaded-but-
+# frozen sim (miscompile signature) reports ok=false, not ok=true.
 .venv/Scripts/python -m newton_worker canary --solver mujoco
 
 # Serve (what the UE plugin spawns); prints "READY <endpoint>" when bound
 .venv/Scripts/python -m newton_worker serve --endpoint tcp://127.0.0.1:5580
+
+# qpos-trace parity (Milestone B acceptance artifact): same ctrl trajectory
+# through plain mj_step and the worker; JSON report + verdict.
+.venv/Scripts/python -m newton_worker parity --mjcf <model.xml> --solver mujoco_cpu `
+    --steps 2000 --fix-base --no-contact --out parity_artifacts/<name>.json
 ```
+
+`parity` options: `--fix-base` strips free joints (a floorless free-base
+robot spends the run in free fall); `--no-contact` disables contacts on both
+sides (pure articulated-dynamics parity — contact-set translation currently
+differs, see below); the ctrl sweep ramps in over 0.5 s because a step input
+slams stiff servos into force saturation where tiny model differences
+amplify chaotically. Recorded artifacts live in `parity_artifacts/`.
 
 Protocol: ZMQ REQ/REP, msgpack (JSON accepted; replies mirror the request
 codec). Ops: `hello`, `load_model`, `step`, `reset`, `set_state` (reserved),
@@ -62,11 +80,63 @@ evidence, when the environment cannot produce a live simulation.
   and maps qpos/qvel indices and names back to it (`_build_interchange_map`),
   keeping the wire contract in original-MJCF terms. Actuator `ctrl` order is
   original-MJCF order by construction (`add_mjcf(ctrl_direct=True)`).
+  Unnamed original joints (the re-export names them `..._joint_<i>`) map
+  positionally, validated by requiring every *named* joint to map
+  order-preservingly.
+- **`read_state` must branch on the solver flavor.** With
+  `use_mujoco_cpu=True`, SolverMuJoCo still *creates* `mjw_data` but steps
+  plain `mj_data`, leaving the warp copy frozen at the initial state —
+  reading whichever exists silently returns a dead sim. `_live_mjw_data()`
+  mirrors the solver's own `self.mj_data if use_mujoco_cpu else mjw_data`
+  branching. (This bug shipped undetected because the original dev machine
+  could never run the CPU e2e liveness tests.)
+- **`load` pre-warms the kernels.** The first `solver.step` of a new model
+  JIT-compiles and loads its warp kernels (minutes cold, tens of seconds
+  warm) — that must happen inside `load_model`'s generous timeout, not on
+  the first `step` RPC (the UE side allows ~2 s per step and treats a
+  timeout as a worker failure). `load` steps once and rebuilds; kernels stay
+  cached in-process, so the rebuild costs one model build, not a recompile.
 - `ramms_newton_worker.py` (JSON-over-stdio) is the previous-generation
   worker; it is retired by this package and kept only until the UE side
   switches over.
 
-## Known issue on this dev machine (updated 2026-08-05): hardware, not warp
+## Parity findings (2026-08-06, Threadripper 9960X / RTX 5090)
+
+Recorded in `parity_artifacts/`; versions inside each JSON.
+
+- **Pendulum**: PASS on both solvers, max |dqpos| ≈ 6e-4 over 4 s (the
+  residual is the re-export forcing `implicitfast` where the original used
+  Euler, plus f32 vs f64).
+- **gen3_2f85 fixed-base, contacts disabled**: PASS, max |dqpos| ≈ 1e-4 over
+  4 s on both `mujoco_cpu` and CUDA (pinned env: newton 1.5.0rc2 /
+  mujoco-warp 3.11) — articulated dynamics translate essentially exactly
+  after the model fixes below.
+- **gen3_2f85 fixed-base, contacts on**: FAILS at ~0.5 rad. CPU and GPU
+  metrics are bit-for-bit similar, so the gap is Newton's **contact-model
+  translation**, not a solver: the re-export rewrites collision filtering
+  (nexclude 6 → 84, contype/conaffinity reworked, condim histogram halved).
+  Upstream issue to file; grasping parity (Milestone E) depends on it.
+
+Model/import fixes that fell out of the parity runs:
+
+- **`solreflimit="0.005"` (single value)**: plain MuJoCo pads to
+  `[0.005, 1]`; newton's importer produced the invalid `[0.005, 0]`
+  (upstream bug worth filing). Our gen3 MJCFs now write the explicit
+  two-value form.
+- **`2f85_base_mount` had no explicit `<inertial>`**: MuJoCo derives 0.150 kg
+  from all geoms (visual + collision), newton from a different subset
+  (0.070 kg). The MJCFs now author the inertial explicitly with MuJoCo's
+  computed values. Lesson: **author explicit inertials for every body** that
+  more than one importer will consume.
+- **sm_120 (RTX 5090 / Blackwell) GPU mesh CCD crash**: mujoco-warp
+  3.10.0.3's `ccd_kernel` (mesh pairs) faults with CUDA error 700 on
+  sm_120 — deterministic, survives cache clears, stack-size bumps, and
+  `use_mujoco_contacts=True` (CCD grid sizing runs at init regardless).
+  **Fixed in mujoco-warp 3.11.0** — the vendored newton was bumped to
+  v1.5.0rc2 (2026-08-06) for exactly this; upstream report still worth
+  filing for 3.10.x users.
+
+## Known issue on the previous dev machine (updated 2026-08-05): hardware, not warp
 
 warp kernel compilation crashes on this machine, but the 2026-08-05
 investigation ruled software out and confirmed **machine-level hardware

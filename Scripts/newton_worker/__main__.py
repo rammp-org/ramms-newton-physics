@@ -18,6 +18,14 @@ import sys
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Dispatched before argparse: REMAINDER-style forwarding through a
+    # subparser drops leading optionals (--mjcf ...) on Python 3.12.
+    if argv and argv[0] == "parity":
+        from . import parity
+
+        return parity.main(argv[1:])
+
     parser = argparse.ArgumentParser(prog="newton_worker")
     parser.add_argument("--probe", action="store_true", help="print capability JSON and exit")
     parser.add_argument("--verbose", action="store_true")
@@ -28,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
         "canary", help="load+step a tiny model in a subprocess; print JSON verdict"
     )
     canary_parser.add_argument("--solver", default="mujoco")
+    subparsers.add_parser(
+        "parity",
+        help="qpos-trace parity: plain mj_step vs the worker (own --help; see parity.py)",
+        add_help=False,
+    )
     inner_parser = subparsers.add_parser("canary-inner")  # internal: runs in-process
     inner_parser.add_argument("--solver", default="mujoco")
     args = parser.parse_args(argv)
@@ -64,8 +77,13 @@ def main(argv: list[str] | None = None) -> int:
 
         sim = NewtonSim()
         sim.load(CANARY_MJCF, solver=args.solver)
-        sim.step(ctrl=[0.0], nsteps=3)
+        state = sim.step(ctrl=[0.0], nsteps=50)
         sim.close()
+        if state["qpos"][0] == 0.0 and state["qvel"][0] == 0.0:
+            # Loaded but frozen: silent-miscompile / dead-readback signature.
+            # The rod must sag under gravity; "no crash" is not "alive".
+            print("CANARY_DEAD", flush=True)
+            return 1
         print("CANARY_OK", flush=True)
         return 0
 
