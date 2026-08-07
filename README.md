@@ -58,15 +58,15 @@ Key properties:
 | `ThirdParty/newton` | Upstream newton checkout (installed editable into the venv); currently at tag **v1.5.0rc2** (pins mujoco / mujoco-warp 3.11 — required for GPU mesh collision on Blackwell/sm_120) |
 | `Scripts/ramms_newton_worker.py` | Previous-generation JSON-over-stdio worker — retired, kept only until nothing references it |
 
-## Status (2026-08-06)
+## Status (2026-08-07)
 
 Milestones from plan §5.5:
 
 | Milestone | State |
 |-----------|-------|
 | **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 27-test pytest suite; UE client/settings/subsystem; probe + canary (now liveness-checking) + liveness machinery |
-| **B** — CustomStepHandler end-to-end | **Worker side runtime-validated** on a healthy machine (Threadripper 9960X / RTX 5090): qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU). Contact-regime parity blocked on Newton's contact-set translation (see Known issues). **UE PIE validation still open** |
-| **C** — lifecycle | **Core implemented** (reset detection/resync, restore refusal, mid-run attach policy, recompile rebind, crash fallback, PIE teardown). Open: worker `set_state`, replay-displacement detection |
+| **B** — CustomStepHandler end-to-end | **Runtime-validated, worker AND UE PIE.** Worker: qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU); contact-regime parity blocked on Newton's contact-set translation (see Known issues). UE (2026-08-07, RTX 4090): simulate session on `Map_GraspTestURL` — component binds in ~16 s warm (GPU solver, nq=42) and steps the scene through the worker |
+| **C** — lifecycle | **Core implemented; reset path runtime-validated in PIE** (`ResetSimulation()` → handler detects the time jump → worker resync in ~2 s → stepping resumes; clean deactivate + zero orphaned workers on EndPlay). Open: worker `set_state`, replay-displacement detection |
 | **D** — editor tooling | **First cut done** (three menu actions). Open: toolbar status pill (worker alive / solver / achieved Hz), per-manager backend selector UX |
 | **E** — fleet mirror + gen3_2f85 grasp under Newton | Not started |
 
@@ -158,14 +158,23 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
   attributes** in robot MJCFs — newton's importer disagrees with MuJoCo
   about geom-derived inertials (visual geoms) and mis-parses single-value
   solref as `[t, 0]`. Both bit us on gen3_2f85 (fixed in `mujoco/gen3_2f85/`).
-- **The original dev machine (i9-14900K) cannot compile warp kernels** —
-  degraded Raptor Lake silicon causes random native-compiler crashes
-  (0xC0000005/0xC0000409/0xC000001D) and occasional *silent miscompiles*
-  (loaded-but-frozen sims). This is a hardware defect, not a code issue; it is
-  why Milestone B/C runtime validation is pending. Details + upstream-report
-  material in `Scripts/README.md`. The probe/canary/liveness machinery exists
-  precisely to detect such environments and report "unavailable" instead of
-  crashing or lying.
+- **The worker's stdout/stderr pipe MUST be drained continuously** — UE's
+  `CreateProc` routes both into one pipe, and a full pipe buffer blocks the
+  worker mid-`write` (observed 2026-08-07: trimesh's per-mesh warnings during
+  a scene load deadlocked `load_model` indefinitely; worker idle, blocked in
+  `logging emit`). `FRammsNewtonWorkerClient` now drains in its recv poll
+  loop, the READY wait, and shutdown, and the worker quiets `trimesh` logging
+  by default — but any new wait-on-worker code path must call
+  `DrainWorkerOutput()` or it will reintroduce the hang.
+- **The 2026-08 "i9-14900K degraded silicon" theory was WRONG** — the
+  original dev machine's warp compile crashes (0xC0000005/0xC0000409/
+  0xC000001D, plus silent miscompiles) disappeared entirely after the
+  mujoco-warp 3.8/3.10 → 3.11 bump: full gate (canaries, 27 tests w/ GPU,
+  parity) passes on that machine as of 2026-08-07. Root cause was evidently
+  a pathological kernel TU in older mujoco-warp versions crashing warp's
+  bundled clang. The probe/canary/liveness machinery stays — it is what
+  detects such environments and reports "unavailable" instead of crashing
+  or lying.
 - warp 1.16's no-PCH CPU path is broken independently (deterministic NULL AV
   on any kernel); keep precompiled headers at default.
 - `Scripts/README.md` documents the SolverMuJoCo re-export mapping and the
@@ -173,10 +182,13 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
 
 ## Pickup checklist (next work, in order)
 
-1. **Validate Milestone B/C in PIE** — solver component on a URLab scene,
-   confirm Newton stepping activates, reset/rebind behave. The worker-side
-   half of B is done (parity harness + artifacts, 2026-08-06; newton bumped
-   to v1.5.0rc2 the same day, so the GPU solver covers mesh robots).
+1. ~~Validate Milestone B/C in PIE~~ **DONE 2026-08-07** (simulate session on
+   `Map_GraspTestURL`: bind ~16 s warm, GPU solver, reset resync ~2 s, clean
+   teardown; the session also flushed out and fixed the pipe-backpressure
+   deadlock — see Known issues). Remaining B/C validation nuance: that scene
+   has nu=0 (URLab drives it via mocap/EE controller), so PIE ctrl-forwarding
+   is exercised only by the CLI parity harness so far — worth a follow-up on
+   an actuator-driven scene.
 2. Worker `set_state` (protocol op exists, returns not_implemented) — unlocks
    snapshot restore and divergence-free reset/attach. Needs engine-side state
    injection semantics validated against SolverMuJoCo internals.

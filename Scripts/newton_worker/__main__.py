@@ -50,6 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         format="[newton_worker] %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+    # Mesh importers (trimesh) warn per degenerate face — on real scenes that
+    # is thousands of lines into a pipe the UE client must drain. Keep it down
+    # unless explicitly debugging.
+    if not args.verbose:
+        logging.getLogger("trimesh").setLevel(logging.ERROR)
 
     if args.probe:
         from .probe import capabilities

@@ -342,6 +342,7 @@ void FRammsNewtonWorkerClient::Stop(bool bRequestShutdown)
 		const double Deadline = FPlatformTime::Seconds() + ShutdownGraceSeconds;
 		while (FPlatformProcess::IsProcRunning(WorkerProc) && FPlatformTime::Seconds() < Deadline)
 		{
+			DrainWorkerOutput(); // a blocked write would otherwise stall its exit
 			FPlatformProcess::Sleep(0.05f);
 		}
 		if (FPlatformProcess::IsProcRunning(WorkerProc))
@@ -403,6 +404,19 @@ bool FRammsNewtonWorkerClient::CreateSocket(FString& OutError)
 	return true;
 }
 
+void FRammsNewtonWorkerClient::DrainWorkerOutput()
+{
+	if (!StdOutReadPipe)
+	{
+		return;
+	}
+	const FString Chunk = FPlatformProcess::ReadPipe(StdOutReadPipe);
+	if (!Chunk.IsEmpty())
+	{
+		UE_LOG(LogRammsNewton, VeryVerbose, TEXT("[worker] %s"), *Chunk.Left(2048));
+	}
+}
+
 void FRammsNewtonWorkerClient::DestroySocket()
 {
 	if (ZmqSocket)
@@ -447,9 +461,15 @@ bool FRammsNewtonWorkerClient::Request(
 	FJsonSerializer::Serialize(Message, Writer);
 
 	const FTCHARToUTF8 Utf8(*Payload);
-	const int		   TimeoutMs = FMath::Max(1, static_cast<int>(TimeoutSeconds * 1000.0));
-	zmq_setsockopt(ZmqSocket, ZMQ_SNDTIMEO, &TimeoutMs, sizeof(TimeoutMs));
-	zmq_setsockopt(ZmqSocket, ZMQ_RCVTIMEO, &TimeoutMs, sizeof(TimeoutMs));
+	const int		   SendTimeoutMs = FMath::Max(1, static_cast<int>(TimeoutSeconds * 1000.0));
+	// Receive in short slices so we can service the worker's output pipe
+	// between polls: the child's stdout AND stderr feed our pipe, and a full
+	// pipe buffer blocks the worker mid-write (observed: trimesh warning spam
+	// during mesh-heavy load_model deadlocked the whole load). Draining here
+	// is what keeps long ops safe; it also gives dead-worker fast-fail.
+	const int PollTimeoutMs = 250;
+	zmq_setsockopt(ZmqSocket, ZMQ_SNDTIMEO, &SendTimeoutMs, sizeof(SendTimeoutMs));
+	zmq_setsockopt(ZmqSocket, ZMQ_RCVTIMEO, &PollTimeoutMs, sizeof(PollTimeoutMs));
 
 	if (zmq_send(ZmqSocket, Utf8.Get(), Utf8.Length(), 0) < 0)
 	{
@@ -471,7 +491,12 @@ bool FRammsNewtonWorkerClient::Request(
 		if (zmq_msg_recv(&Reply, ZmqSocket, 0) < 0)
 		{
 			zmq_msg_close(&Reply);
+			DrainWorkerOutput();
 			const bool bAlive = IsWorkerProcessAlive();
+			if (bAlive && FPlatformTime::Seconds() < Deadline)
+			{
+				continue; // still within budget — keep polling (and draining)
+			}
 			OutError = FString::Printf(
 				TEXT("no reply to '%s' within %.1fs (%s)"),
 				Op, TimeoutSeconds,
@@ -481,6 +506,7 @@ bool FRammsNewtonWorkerClient::Request(
 			CreateSocket(Unused);
 			return false;
 		}
+		DrainWorkerOutput();
 
 		FUTF8ToTCHAR  Wide(static_cast<const ANSICHAR*>(zmq_msg_data(&Reply)), zmq_msg_size(&Reply));
 		const FString ReplyText(Wide.Length(), Wide.Get());

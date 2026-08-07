@@ -91,6 +91,14 @@ private:
 	void DestroySocket();
 	void CloseProcess();
 
+	/**
+	 * Empty the worker's stdout/stderr pipe. MUST be called regularly while
+	 * waiting on the worker: the child blocks writing once the pipe buffer
+	 * fills, which deadlocks chatty operations (e.g. mesh-import warnings
+	 * during load_model). Non-empty chunks are logged VeryVerbose.
+	 */
+	void DrainWorkerOutput();
+
 	static bool ParseStepResult(const TSharedPtr<FJsonObject>& Result, FRammsNewtonStepResult& Out);
 	static void ParseCapabilities(const TSharedPtr<FJsonObject>& Json, FRammsNewtonCapabilities& Out);
 
