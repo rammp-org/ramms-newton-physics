@@ -552,6 +552,26 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 				return;
 			}
 
+			// Never write a diverged solver state into URLab: NaN qpos would
+			// propagate through mj_forward into every sensor/publisher and
+			// leave nothing for the local fallback to resume from.
+			bool bFinite = true;
+			for (double Value : Result.Qpos)
+			{
+				bFinite &= FMath::IsFinite(Value);
+			}
+			for (double Value : Result.Qvel)
+			{
+				bFinite &= FMath::IsFinite(Value);
+			}
+			if (!bFinite)
+			{
+				SetStatus(TEXT("Worker returned non-finite state (solver diverged)"));
+				bStepFailed.store(true);
+				mj_step(Model, Data);
+				return;
+			}
+
 			FMemory::Memcpy(Data->qpos, Result.Qpos.GetData(), Model->nq * sizeof(double));
 			FMemory::Memcpy(Data->qvel, Result.Qvel.GetData(), Model->nv * sizeof(double));
 			if (Model->na > 0 && Result.Act.Num() == Model->na)
