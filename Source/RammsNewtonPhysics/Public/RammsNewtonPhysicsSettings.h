@@ -71,6 +71,18 @@ public:
 	float StepTimeoutSeconds = 2.0f;
 
 	/**
+	 * One-step pipelining (plan §6.8 option 1): the step handler collects the
+	 * PREVIOUS step's result (usually already arrived) and immediately sends
+	 * the next request, hiding the worker round-trip behind UE's frame work.
+	 * Writeback is one substep (one model timestep) stale — physically
+	 * negligible — and throughput becomes worker-compute-bound instead of
+	 * RTT-bound (the un-pipelined bridge ran ~0.1x realtime). Disable for the
+	 * strictly synchronous exchange.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Worker")
+	bool bPipelineSteps = true;
+
+	/**
 	 * Probe availability automatically the first time something asks for it
 	 * (subsystem/component). Disable to only probe on explicit request.
 	 */

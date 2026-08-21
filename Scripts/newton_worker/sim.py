@@ -19,6 +19,7 @@ in-place reset/set_state lands with the lifecycle milestone.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 SOLVER_MUJOCO = "mujoco"
 SOLVER_MUJOCO_CPU = "mujoco_cpu"
@@ -93,6 +96,8 @@ class NewtonSim:
         self._scene_dir: str | None = None
         self.sim_time = 0.0
         self.step_count = 0
+        self._step_graph = None
+        self._graph_capture_failed = False
 
     # ------------------------------------------------------------------ load
 
@@ -152,6 +157,13 @@ class NewtonSim:
                     nshape = int(getattr(self.model, "shape_count", 0) or 0)
                     options.setdefault("nconmax", max(4096, 32 * nshape))
                     options.setdefault("njmax", max(4 * options["nconmax"], 16384))
+                    # mjw_data is our sole authoritative state (set_state and
+                    # mocap write it directly; read_state reads it). Disabling
+                    # the per-step Newton-state -> mjw_data sync removes a lossy
+                    # roundtrip AND is required for CUDA-graph stepping: the
+                    # graph bakes array pointers, so the state_0/state_1
+                    # ping-pong must not feed back into the solver.
+                    options.setdefault("update_data_interval", 0)
                 self.solver = newton.solvers.SolverMuJoCo(
                     self.model,
                     use_mujoco_cpu=(solver == SOLVER_MUJOCO_CPU),
@@ -389,14 +401,56 @@ class NewtonSim:
 
         try:
             for _ in range(nsteps):
-                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
-                self.state_0, self.state_1 = self.state_1, self.state_0
+                if not self._graph_step():
+                    self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
+                    self.state_0, self.state_1 = self.state_1, self.state_0
         except Exception as exc:
             raise SimError(f"step failed: {type(exc).__name__}: {exc}") from exc
 
         self.step_count += nsteps
         self.sim_time += nsteps * self.dt
         return self.read_state()
+
+    def _graph_step(self) -> bool:
+        """Advance one substep by CUDA-graph replay; False = caller steps eagerly.
+
+        Single-env mujoco-warp is kernel-launch-latency-bound: an eager
+        solver.step costs ~10 ms in Python/launch overhead regardless of model
+        size, which capped the UE bridge near 0.2x realtime. Replaying the
+        step as a captured CUDA graph is the standard mjwarp pattern and cuts
+        that to well under a millisecond.
+
+        Correctness rests on update_data_interval=0 (set at load): mjw_data is
+        the sole authoritative state, ctrl/mocap/set_state all write into
+        arrays the graph reads by pointer, and the Newton states are dead
+        outputs — so one captured launch sequence stays valid for the life of
+        the model. Any capture failure (sync inside the step path, older warp)
+        permanently falls back to eager stepping for this model.
+        """
+        if self.solver_name != SOLVER_MUJOCO or self._graph_capture_failed:
+            return False
+        if self.step_count == 0:
+            # First step after a (re)build runs eagerly: it flushes the
+            # solver's lazy one-time work so none of it gets baked into the
+            # capture.
+            return False
+
+        import warp as wp
+
+        if self._step_graph is None:
+            try:
+                with wp.ScopedDevice(self.model.device):
+                    with wp.ScopedCapture() as capture:
+                        self.solver.step(
+                            self.state_0, self.state_1, self.control, self.contacts, self.dt
+                        )
+                self._step_graph = capture.graph
+            except Exception:
+                log.exception("CUDA graph capture failed; stepping eagerly")
+                self._graph_capture_failed = True
+                return False
+        wp.capture_launch(self._step_graph)
+        return True
 
     def _live_mjw_data(self):
         """The warp-side data ONLY when the solver actually steps it.
@@ -543,6 +597,8 @@ class NewtonSim:
 
     def close(self) -> None:
         self._loaded = False
+        self._step_graph = None
+        self._graph_capture_failed = False
         for attr in ("solver", "model", "state_0", "state_1", "control", "contacts"):
             if hasattr(self, attr):
                 delattr(self, attr)

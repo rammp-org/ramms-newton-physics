@@ -419,6 +419,7 @@ void FRammsNewtonWorkerClient::DrainWorkerOutput()
 
 void FRammsNewtonWorkerClient::DestroySocket()
 {
+	bStepPending.store(false);
 	if (ZmqSocket)
 	{
 		zmq_close(ZmqSocket);
@@ -431,24 +432,22 @@ void FRammsNewtonWorkerClient::DestroySocket()
 	}
 }
 
-bool FRammsNewtonWorkerClient::Request(
+bool FRammsNewtonWorkerClient::SendRequest(
 	const TCHAR*				   Op,
 	const TSharedPtr<FJsonObject>& Params,
 	double						   TimeoutSeconds,
-	TSharedPtr<FJsonObject>&	   OutResult,
+	int32&						   OutRequestId,
 	FString&					   OutError)
 {
-	FScopeLock Lock(&RequestMutex);
-
 	if (!ZmqSocket)
 	{
 		OutError = TEXT("worker not connected");
 		return false;
 	}
 
-	const int32					  RequestId = NextRequestId++;
+	OutRequestId = NextRequestId++;
 	const TSharedRef<FJsonObject> Message = MakeShared<FJsonObject>();
-	Message->SetNumberField(TEXT("id"), RequestId);
+	Message->SetNumberField(TEXT("id"), OutRequestId);
 	Message->SetStringField(TEXT("op"), Op);
 	if (Params.IsValid())
 	{
@@ -475,9 +474,25 @@ bool FRammsNewtonWorkerClient::Request(
 	{
 		OutError = FString::Printf(TEXT("send '%s' failed: %hs"), Op, zmq_strerror(zmq_errno()));
 		// A REQ socket is poisoned after a failed exchange — rebuild it.
+		bStepPending.store(false);
 		DestroySocket();
 		FString Unused;
 		CreateSocket(Unused);
+		return false;
+	}
+	return true;
+}
+
+bool FRammsNewtonWorkerClient::RecvReply(
+	int32					 RequestId,
+	const TCHAR*			 Op,
+	double					 TimeoutSeconds,
+	TSharedPtr<FJsonObject>& OutResult,
+	FString&				 OutError)
+{
+	if (!ZmqSocket)
+	{
+		OutError = TEXT("worker not connected");
 		return false;
 	}
 
@@ -501,6 +516,7 @@ bool FRammsNewtonWorkerClient::Request(
 				TEXT("no reply to '%s' within %.1fs (%s)"),
 				Op, TimeoutSeconds,
 				bAlive ? TEXT("worker alive but unresponsive") : TEXT("worker process is dead"));
+			bStepPending.store(false);
 			DestroySocket();
 			FString Unused;
 			CreateSocket(Unused);
@@ -559,6 +575,39 @@ bool FRammsNewtonWorkerClient::Request(
 		}
 		return true;
 	}
+}
+
+void FRammsNewtonWorkerClient::DrainPendingStep()
+{
+	if (!bStepPending.load())
+	{
+		return;
+	}
+	// Discarding the reply is safe: the callers that get here are lifecycle
+	// ops (reset / set_state / shutdown) that re-establish state themselves.
+	TSharedPtr<FJsonObject> Discarded;
+	FString					Error;
+	RecvReply(PendingStepId, TEXT("step(pipelined)"),
+		URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, Discarded, Error);
+	bStepPending.store(false);
+}
+
+bool FRammsNewtonWorkerClient::Request(
+	const TCHAR*				   Op,
+	const TSharedPtr<FJsonObject>& Params,
+	double						   TimeoutSeconds,
+	TSharedPtr<FJsonObject>&	   OutResult,
+	FString&					   OutError)
+{
+	FScopeLock Lock(&RequestMutex);
+	DrainPendingStep();
+
+	int32 RequestId = 0;
+	if (!SendRequest(Op, Params, TimeoutSeconds, RequestId, OutError))
+	{
+		return false;
+	}
+	return RecvReply(RequestId, Op, TimeoutSeconds, OutResult, OutError);
 }
 
 bool FRammsNewtonWorkerClient::Hello(FRammsNewtonCapabilities& OutCapabilities, FString& OutError)
@@ -638,13 +687,11 @@ bool FRammsNewtonWorkerClient::ParseStepResult(
 	return bHaveQpos && bHaveQvel;
 }
 
-bool FRammsNewtonWorkerClient::Step(
+TSharedRef<FJsonObject> FRammsNewtonWorkerClient::BuildStepParams(
 	TConstArrayView<double> Ctrl,
 	TConstArrayView<double> MocapPos,
 	TConstArrayView<double> MocapQuat,
-	int32					Nsteps,
-	FRammsNewtonStepResult& OutState,
-	FString&				OutError)
+	int32					Nsteps)
 {
 	const TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
 	Params->SetNumberField(TEXT("nsteps"), Nsteps);
@@ -678,15 +725,115 @@ bool FRammsNewtonWorkerClient::Step(
 	};
 	AddNestedArray(TEXT("mocap_pos"), MocapPos, 3);
 	AddNestedArray(TEXT("mocap_quat"), MocapQuat, 4);
+	return Params;
+}
 
+bool FRammsNewtonWorkerClient::Step(
+	TConstArrayView<double> Ctrl,
+	TConstArrayView<double> MocapPos,
+	TConstArrayView<double> MocapQuat,
+	int32					Nsteps,
+	FRammsNewtonStepResult& OutState,
+	FString&				OutError)
+{
 	TSharedPtr<FJsonObject> Result;
-	if (!Request(TEXT("step"), Params, URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, Result, OutError))
+	if (!Request(TEXT("step"), BuildStepParams(Ctrl, MocapPos, MocapQuat, Nsteps),
+			URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, Result, OutError))
 	{
 		return false;
 	}
 	if (!ParseStepResult(Result, OutState))
 	{
 		OutError = TEXT("step reply missing qpos/qvel");
+		return false;
+	}
+	return true;
+}
+
+bool FRammsNewtonWorkerClient::StepBegin(
+	TConstArrayView<double> Ctrl,
+	TConstArrayView<double> MocapPos,
+	TConstArrayView<double> MocapQuat,
+	int32					Nsteps,
+	FString&				OutError)
+{
+	FScopeLock Lock(&RequestMutex);
+	DrainPendingStep(); // at most one step in flight (REQ/REP alternation)
+
+	int32 RequestId = 0;
+	if (!SendRequest(TEXT("step"), BuildStepParams(Ctrl, MocapPos, MocapQuat, Nsteps),
+			URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, RequestId, OutError))
+	{
+		return false;
+	}
+	PendingStepId = RequestId;
+	bStepPending.store(true);
+	return true;
+}
+
+bool FRammsNewtonWorkerClient::StepCollect(FRammsNewtonStepResult& OutState, FString& OutError)
+{
+	FScopeLock Lock(&RequestMutex);
+	if (!bStepPending.load())
+	{
+		OutError = TEXT("no step in flight");
+		return false;
+	}
+	TSharedPtr<FJsonObject> Result;
+	const bool				bOk = RecvReply(PendingStepId, TEXT("step"),
+		URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, Result, OutError);
+	bStepPending.store(false);
+	if (!bOk)
+	{
+		return false;
+	}
+	if (!ParseStepResult(Result, OutState))
+	{
+		OutError = TEXT("step reply missing qpos/qvel");
+		return false;
+	}
+	return true;
+}
+
+bool FRammsNewtonWorkerClient::SetState(
+	TConstArrayView<double> Qpos,
+	TConstArrayView<double> Qvel,
+	TConstArrayView<double> Act,
+	double					Time,
+	FRammsNewtonStepResult& OutState,
+	FString&				OutError)
+{
+	const TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	auto						  AddArray = [&Params](const TCHAR* Field, TConstArrayView<double> Values) {
+		if (Values.Num() == 0)
+		{
+			return;
+		}
+		TArray<TSharedPtr<FJsonValue>> Json;
+		Json.Reserve(Values.Num());
+		for (double Value : Values)
+		{
+			Json.Add(MakeShared<FJsonValueNumber>(Value));
+		}
+		Params->SetArrayField(Field, Json);
+	};
+	AddArray(TEXT("qpos"), Qpos);
+	AddArray(TEXT("qvel"), Qvel);
+	AddArray(TEXT("act"), Act);
+	if (Time >= 0.0)
+	{
+		Params->SetNumberField(TEXT("time"), Time);
+	}
+
+	TSharedPtr<FJsonObject> Result;
+	if (!Request(TEXT("set_state"), Params,
+			URammsNewtonPhysicsSettings::Get().StepTimeoutSeconds, Result, OutError))
+	{
+		return false;
+	}
+	if (!ParseStepResult(Result, OutState))
+	{
+		OutError = TEXT("set_state reply missing qpos/qvel");
 		return false;
 	}
 	return true;

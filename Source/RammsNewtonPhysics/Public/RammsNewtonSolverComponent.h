@@ -14,6 +14,7 @@
 class FRammsNewtonWorkerClient;
 class UMjPhysicsEngine;
 struct mjModel_;
+struct mjData_;
 
 /**
  * Swaps URLab's mj_step for Newton stepping (plan §5.3, "Newton steps,
@@ -49,13 +50,17 @@ public:
 	bool bActivateOnBeginPlay = true;
 
 	/**
-	 * If the sim already advanced past its initial state when the worker
-	 * finishes loading, reset the simulation so both sides start aligned at
-	 * t=0. When false, activation is refused instead (the worker can only
-	 * start from the model's initial state until set_state lands).
+	 * Mid-run attach seeds the worker with the engine's CURRENT state via
+	 * set_state, so no reset is needed. This flag is now only the FALLBACK:
+	 * if seeding fails and it is true, the simulation is reset so both sides
+	 * align at t=0; if false, activation is refused instead.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Newton")
 	bool bResetSimOnActivate = true;
+
+	/** Steps per second achieved by the Newton bridge (5 s sliding window). */
+	UFUNCTION(BlueprintPure, Category = "Newton")
+	float GetAchievedHz() const { return AchievedHz.load(); }
 
 	/** Begin (or retry) taking over stepping. Loads happen asynchronously. */
 	UFUNCTION(BlueprintCallable, Category = "Newton")
@@ -99,8 +104,25 @@ private:
 	UMjPhysicsEngine* FindEngine() const;
 	void			  BeginBind(UMjPhysicsEngine* Engine);
 	void			  InstallHandler(UMjPhysicsEngine* Engine);
+	void			  FinishInstall(UMjPhysicsEngine* Engine);
 	void			  UninstallHandler();
 	void			  SetStatus(const FString& InStatus);
+
+	/**
+	 * Push the engine's current qpos/qvel/act/time into the worker
+	 * (thread-pool task; captures state under CallbackMutex, then RPCs).
+	 * bResetWorkerFirst mirrors a sim reset with a worker rebuild before the
+	 * injection. OnDone runs on the game thread with the outcome.
+	 */
+	void BeginStateSync(bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone);
+
+	/**
+	 * Validate a worker state (layout + finiteness) and write it into mjData,
+	 * advancing time one step and running mj_forward. Physics thread only.
+	 * On failure sets status + bStepFailed and returns false (caller should
+	 * mj_step locally).
+	 */
+	bool ValidateAndWriteback(mjModel_* Model, mjData_* Data, const FRammsNewtonStepResult& Result);
 
 	/** Worker connection; shared so background load/teardown tasks can outlive the component. */
 	TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> Client;
@@ -123,10 +145,10 @@ private:
 	enum class EResyncRequest : uint8
 	{
 		None = 0,
-		/** d->time snapped to ~0: URLab reset — mirror it with a worker reset. */
+		/** d->time snapped to ~0: URLab reset — worker reset + state injection. */
 		Reset = 1,
-		/** d->time jumped mid-run: snapshot restore — unsupported until worker set_state. */
-		Unsupported = 2,
+		/** d->time jumped mid-run (snapshot restore) — worker set_state injection. */
+		SetState = 2,
 	};
 	std::atomic<uint8> PendingResync{ 0 };
 	bool			   bResyncInFlight = false;
@@ -151,4 +173,16 @@ private:
 	TArray<double> CtrlScratch;
 	TArray<double> MocapPosScratch;
 	TArray<double> MocapQuatScratch;
+
+	/** One-step pipelining enabled for the installed handler (settings copy). */
+	bool bPipelineActive = true;
+
+	/** Whether the in-flight pipelined request carried mocap data (physics thread only). */
+	bool bPendingStepHadMocap = false;
+
+	/** Achieved step rate (5 s window, computed in Tick from StepCounter). */
+	std::atomic<uint64> StepCounter{ 0 };
+	std::atomic<float>	AchievedHz{ 0.0f };
+	double				HzWindowStart = 0.0;
+	uint64				HzWindowStartCount = 0;
 };
