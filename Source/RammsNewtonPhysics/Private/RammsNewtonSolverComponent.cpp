@@ -562,9 +562,21 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 					{
 						return;
 					}
-					This->bLoadInFlight = false;
+					// Deliberately NOT clearing bLoadInFlight here. On the mid-run
+					// path InstallHandler returns as soon as it has kicked off the
+					// asynchronous seed, and ExpectedModel is only stored in
+					// FinishInstall — so between the two, Tick's rebind guard
+					// (GetModel() != ExpectedModel && !bLoadInFlight) is true and
+					// would call BeginBind again every frame, re-flattening the
+					// scene and re-running load_model on the worker, which
+					// rebuilds the Newton model at t=0 underneath the set_state
+					// still in flight. Since a worker load takes seconds, the
+					// engine has always advanced by then, so the mid-run path is
+					// the normal activation path rather than an edge case.
+					// FinishInstall and every refusal below clear the flag.
 					if (!This->bWantActive)
 					{
+						This->bLoadInFlight = false;
 						return; // deactivated while loading
 					}
 					UMjPhysicsEngine* Engine = WeakEngine.Get();
@@ -572,12 +584,15 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 					{
 						This->SetStatus(FString::Printf(TEXT("Newton bind failed: %s"), *BindError));
 						This->bWantActive = false;
+						This->bLoadInFlight = false;
 						return;
 					}
 					if (!Engine || Engine->GetModel() != Model)
 					{
-						// Recompiled while we were loading; Tick will rebind.
+						// Recompiled while we were loading; Tick must be free to
+						// rebind, so the guard has to come down here.
 						This->SetStatus(TEXT("Model changed during load — rebinding"));
+						This->bLoadInFlight = false;
 						return;
 					}
 					This->ModelInfo = Info;
@@ -617,6 +632,14 @@ void URammsNewtonSolverComponent::BeginStateSync(
 				// the RPC. Holding the lock stalls the physics thread for the
 				// duration instead, which is a hitch on a rare event rather
 				// than a silent rewind on every one.
+				//
+				// Cost, stated honestly: ~1 ms in the measured happy path, but
+				// the worst case is two timeouts rather than one — Request()
+				// drains any in-flight pipelined step before sending, and both
+				// that drain and the set_state itself are bounded by
+				// StepTimeoutSeconds. A dead worker therefore stalls the
+				// physics thread for up to 2 * StepTimeoutSeconds (4 s at the
+				// default) before the failure path runs.
 				TArray<double> Qpos, Qvel, Act;
 				double		   Time = -1.0;
 				if (UMjPhysicsEngine* Engine = WeakEngine.Get())
@@ -699,26 +722,49 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 					// been applied, and one that failed part-way leaves the worker
 					// somewhere unknown; resetting only the engine would let the
 					// first reply overwrite the freshly reset state with that
-					// unknown one. A worker reset that itself fails is worth
-					// refusing the attach over, since nothing after it is trusted.
-					FString				   ResetError;
-					FRammsNewtonStepResult ResetState;
-					if (This->Client.IsValid() && !This->Client->ResetSim(ResetState, ResetError))
-					{
-						This->SetStatus(FString::Printf(
-							TEXT("Refusing to attach: worker reset failed after a failed seed (%s)"),
-							*ResetError));
-						This->bWantActive = false;
-						return;
-					}
-					Engine->ResetSimulation();
-					This->FinishInstall(Engine);
+					// unknown one.
+					//
+					// Off the game thread: a v1 worker reset is a full model
+					// rebuild and is budgeted LoadTimeoutSeconds (600 s by
+					// default), so calling it here — inside a lambda AsyncTask'd
+					// to the game thread — would freeze the editor for minutes
+					// against a wedged worker. Only the engine reset and the
+					// install hop back.
+					TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> ResetClient = This->Client;
+					TWeakObjectPtr<URammsNewtonSolverComponent>				  WeakSelf(This);
+					TWeakObjectPtr<UMjPhysicsEngine>						  WeakEng(Engine);
+					Async(EAsyncExecution::ThreadPool, [ResetClient, WeakSelf, WeakEng]() {
+						FString				   ResetError;
+						FRammsNewtonStepResult ResetState;
+						const bool			   bReset =
+							!ResetClient.IsValid() || ResetClient->ResetSim(ResetState, ResetError);
+						AsyncTask(ENamedThreads::GameThread, [WeakSelf, WeakEng, bReset, ResetError]() {
+							URammsNewtonSolverComponent* Self = WeakSelf.Get();
+							UMjPhysicsEngine*			 Eng = WeakEng.Get();
+							if (!Self || !Eng || !Self->bWantActive)
+							{
+								return;
+							}
+							if (!bReset)
+							{
+								Self->SetStatus(FString::Printf(
+									TEXT("Refusing to attach: worker reset failed after a failed seed (%s)"),
+									*ResetError));
+								Self->bWantActive = false;
+								Self->bLoadInFlight = false;
+								return;
+							}
+							Eng->ResetSimulation();
+							Self->FinishInstall(Eng);
+						});
+					});
 					return;
 				}
 				This->SetStatus(FString::Printf(
 					TEXT("Refusing to attach: set_state seeding failed (%s) and bResetSimOnActivate is off"),
 					*Error));
 				This->bWantActive = false;
+				This->bLoadInFlight = false;
 			});
 		return;
 	}
@@ -728,6 +774,8 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 
 void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 {
+	// The install is done, so Tick may judge the binding again from here on.
+	bLoadInFlight = false;
 	BoundEngine = Engine;
 	ExpectedModel.store(Engine->GetModel());
 	bStepFailed.store(false);
@@ -789,6 +837,10 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 				|| PendingResync.load() != static_cast<uint8>(EResyncRequest::None))
 			{
 				mj_step(Model, Data);
+				// Same reason as the jump check below: every local step has to
+				// move the baseline, or servicing a resync leaves a trail of
+				// "unexplained" time jumps behind it.
+				LastSteppedTime.store(Data->time);
 				return Advanced();
 			}
 
@@ -805,6 +857,10 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 				PendingResync.store(static_cast<uint8>(
 					bIsReset ? EResyncRequest::Reset : EResyncRequest::SetState));
 				mj_step(Model, Data);
+				// Re-arm against the step just taken. Leaving it stale makes the
+				// next call read this local step as a fresh external jump and
+				// raise another resync — a self-sustaining loop.
+				LastSteppedTime.store(Data->time);
 				return Advanced();
 			}
 

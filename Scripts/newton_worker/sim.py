@@ -255,6 +255,17 @@ class NewtonSim:
 
         ref_names = joint_names(ref)
         sol_names = joint_names(sol)
+        # act is shipped unmapped, unlike qpos/qvel: there is no actuator
+        # permutation to apply because the re-export drops actuator names.
+        # That is only sound while the activation layouts are identical, so
+        # check it here rather than letting it surface as a per-step layout
+        # mismatch on the UE side, where it reads as a bridge fault.
+        if int(ref.na) != int(sol.na):
+            raise SimError(
+                f"activation count mismatch: original {int(ref.na)}, solver {int(sol.na)} — "
+                "act is shipped unmapped, so this model needs an actuator index map"
+            )
+
         if int(ref.njnt) != int(sol.njnt):
             raise SimError(
                 f"joint count mismatch: original {int(ref.njnt)}, solver {int(sol.njnt)}"
