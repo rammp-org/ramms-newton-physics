@@ -64,9 +64,9 @@ Milestones from plan §5.5:
 
 | Milestone | State |
 |-----------|-------|
-| **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 27-test pytest suite; UE client/settings/subsystem; probe + canary (now liveness-checking) + liveness machinery |
+| **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 31-test pytest suite; UE client/settings/subsystem; probe + canary (now liveness-checking) + liveness machinery |
 | **B** — CustomStepHandler end-to-end | **Runtime-validated, worker AND UE PIE, including actuators.** Worker: qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU); contact-regime parity blocked on Newton's contact-set translation (see Known issues). UE (2026-08-07 PM, RTX 4090): simulate on `Map_GraspTestURL` with the gen3_2f85 articulation BP spawned in-level — binds in ~16 s warm (GPU, **nq=64 nu=8 nmocap=1**) and stepped continuously for 3+ min with live ctrl forwarding (EE-IK position actuators + tendon gripper), mocap forwarding (tracking-base weld target), and contact. Scripted grasp choreography ran end-to-end (approach/close/lift); the grasp itself doesn't hold — free objects slide under Newton's contact translation (measured ~3 mm/s resting drift in-editor; the Milestone E upstream blocker), NOT a bridge issue |
-| **C** — lifecycle | **Core implemented; reset path runtime-validated in PIE** (`ResetSimulation()` → handler detects the time jump → worker resync in ~2 s → stepping resumes; clean deactivate + zero orphaned workers on EndPlay). Worker `set_state` implemented + e2e-tested 2026-08-07 (original-layout qpos/qvel/act/time; scatters through the interchange maps, resyncs the newton State via `_update_newton_state` so the next step's `_update_mjc_data` push keeps the injection, zeroes `qacc_warmstart`). Open: UE-side snapshot-restore consumption, replay-displacement detection |
+| **C** — lifecycle | **Core implemented; reset path runtime-validated in PIE** (`ResetSimulation()` → handler detects the time jump → worker resync in ~2 s → stepping resumes; clean deactivate + zero orphaned workers on EndPlay). Worker `set_state` implemented + e2e-tested 2026-08-07 (original-layout qpos/qvel/act/time; scatters through the interchange maps, resyncs the newton State via `_update_newton_state` so the next step's `_update_mjc_data` push keeps the injection, zeroes `qacc_warmstart`). UE-side consumption now implemented and runtime-validated: the handler detects a restore and pushes state through `BeginStateSync` → worker `set_state`, and also detects an in-place `qpos` edit that leaves `d->time` untouched. Measured on the gen3 (2026-09-18, macOS/arm64, CPU solver): captured at `t=191.56` with `joint_2=2.2401`, drove the arm to `2.3393`, restored — time rolled back to `193.80` and `joint_2` returned to `2.2400`, on one injection, with zero false-positive syncs while free-running, holding a keyframe, or after releasing one. Open: replay-displacement detection |
 | **D** — editor tooling | **First cut done** (three menu actions). Open: toolbar status pill (worker alive / solver / achieved Hz), per-manager backend selector UX |
 | **E** — fleet mirror + gen3_2f85 grasp under Newton | Not started |
 
@@ -76,10 +76,17 @@ Lifecycle semantics implemented in `URammsNewtonSolverComponent` (v1):
   asynchronously (v1 reset = full model rebuild), then resumes. The few
   locally-stepped frames cause a bounded divergence reconciled by the first
   writeback.
-- **Snapshot restore** (mid-run time jump): deactivates cleanly. The worker
-  now implements `set_state` (original-layout qpos/qvel/act/time), so the
-  remaining work is UE-side: forward the restored mjData state instead of
-  deactivating.
+- **Snapshot restore** (mid-run time jump): the handler raises a `SetState`
+  resync, and `BeginStateSync` captures the engine's `qpos`/`qvel`/`act`/`time`
+  and injects them through the worker's `set_state` before stepping resumes.
+  Capture and injection are done under `CallbackMutex` together: releasing it
+  between them lets the fallback keep stepping locally, seeding the worker from
+  a state the engine has already passed and rolling the pose back on the first
+  writeback.
+- **In-place state edit** (`qpos` changed without `d->time` moving): caught by
+  comparing against the last state written back, and pushed the same way. The
+  time-jump check alone misses these, and the next writeback would overwrite
+  them silently.
 - **Mid-run activation**: the worker starts from the model's initial state, so
   the component auto-resets the sim on attach (`bResetSimOnActivate`, default
   on) or refuses.
@@ -224,11 +231,10 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
    the gen3_2f85 BP asset predates the 08-06 MJCF fidelity fixes — reimport
    from `mujoco/gen3_2f85/gen3_2f85_scene_ue.xml` is still pending (parity
    fidelity, not correctness).
-2. ~~Worker `set_state`~~ **worker side DONE 2026-08-07** (e2e-tested on
-   GPU: exact readback, injected state is dynamically live, warm-start
-   invalidated). Remaining: UE-side consumption — snapshot restore and
-   divergence-free reset/attach in `URammsNewtonSolverComponent` (send the
-   current mjData state instead of ResetSim/deactivate).
+2. ~~Worker `set_state`~~ ~~UE-side consumption~~ **both DONE** — worker
+   2026-08-07 (GPU: exact readback, injected state dynamically live, warm-start
+   invalidated); UE side 2026-09-18 (snapshot restore and in-place `qpos` edits
+   both detected and pushed, verified on the gen3 under the CPU solver).
 3. Milestone D remainder: toolbar status pill, backend selector.
 4. Milestone E: `ramms_newton_fleet_mirror.py` (URLab Puppet-mode viewer for
    multi-env fleets) + gen3_2f85 grasp test under Newton — gated on the

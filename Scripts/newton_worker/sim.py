@@ -163,7 +163,21 @@ class NewtonSim:
                     # roundtrip AND is required for CUDA-graph stepping: the
                     # graph bakes array pointers, so the state_0/state_1
                     # ping-pong must not feed back into the solver.
-                    options.setdefault("update_data_interval", 0)
+                    # setdefault is not enough here: a caller passing a
+                    # nonzero value would leave the graph replaying against
+                    # baked pointers while the ping-pong stops feeding them,
+                    # so the solver's own state -> mjw_data sync overwrites
+                    # live state. This is an invariant of how we step, not a
+                    # preference, so an explicit nonzero is refused rather
+                    # than silently honoured.
+                    requested = options.get("update_data_interval", 0)
+                    if requested not in (0, None):
+                        raise SimError(
+                            "update_data_interval must be 0 for this worker "
+                            f"(got {requested!r}): mjw_data is the authoritative "
+                            "state and CUDA-graph stepping bakes its pointers"
+                        )
+                    options["update_data_interval"] = 0
                 self.solver = newton.solvers.SolverMuJoCo(
                     self.model,
                     use_mujoco_cpu=(solver == SOLVER_MUJOCO_CPU),
@@ -555,13 +569,27 @@ class NewtonSim:
                     cpu.reshape((1,) + cpu.shape).astype(np.float32)
                 )
 
+        # Validate every field before writing any of them. Interleaving the two
+        # means a good qpos lands and a bad qvel then raises, leaving the sim
+        # half-injected — a failed request that still changed the simulation.
+        pending = []
+        if qpos is not None:
+            pending.append(("qpos", qpos, self._qpos_idx, int(ref.nq), "qpos"))
+        if qvel is not None:
+            pending.append(("qvel", qvel, self._qvel_idx, int(ref.nv), "qvel"))
+        if act is not None:
+            # A nonempty act against a model with na == 0 is a layout mismatch,
+            # not something to drop on the floor.
+            pending.append(("act", act, None, int(ref.na), "act"))
+        for target_name, values, idx, expected, label in pending:
+            size = np.asarray(values, dtype=np.float64).ravel().size
+            if size != expected:
+                raise SimError(f"{label} has {size} values, model has {expected}")
+
         try:
-            if qpos is not None:
-                scatter("qpos", qpos, self._qpos_idx, int(ref.nq), "qpos")
-            if qvel is not None:
-                scatter("qvel", qvel, self._qvel_idx, int(ref.nv), "qvel")
-            if act is not None and int(ref.na) > 0:
-                scatter("act", act, None, int(ref.na), "act")
+            for target_name, values, idx, expected, label in pending:
+                if expected > 0:
+                    scatter(target_name, values, idx, expected, label)
             if time is not None:
                 self.sim_time = float(time)
 

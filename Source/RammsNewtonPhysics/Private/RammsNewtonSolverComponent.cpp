@@ -292,7 +292,28 @@ bool URammsNewtonSolverComponent::SerializeCompiledModel(
 				TEXT("failed to read asset '%s' (mounted as '%s')"), *Asset.Value, *Asset.Key);
 			return false;
 		}
-		OutAssets.Add(Asset.Key, MoveTemp(Data));
+		// Ship it under the name the flattened XML will ask for. FlattenAssetPaths
+		// rewrites every file= reference down to its basename, so a mounted name
+		// carrying a directory would be written to disk at a path the scene no
+		// longer mentions and the worker's load would fail on a missing file.
+		const FString ShippedName = FPaths::GetCleanFilename(Asset.Key);
+		if (const TArray<uint8>* Existing = OutAssets.Find(ShippedName))
+		{
+			// Two mounts colliding on one basename is unrecoverable rather than
+			// something to resolve by picking a winner: flattening has already
+			// made the scene's two references indistinguishable. Identical bytes
+			// are the one harmless case.
+			if (*Existing != Data)
+			{
+				OutError = FString::Printf(
+					TEXT("two different assets flatten to '%s' (one of them is '%s'); ")
+						TEXT("rename one in the scene so the flattened references stay distinct"),
+					*ShippedName, *Asset.Value);
+				return false;
+			}
+			continue;
+		}
+		OutAssets.Add(ShippedName, MoveTemp(Data));
 	}
 
 	// Newton's MJCF importer does not implement MuJoCo's <attach> / <model
@@ -405,15 +426,20 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 	if (CVarNewtonDumpShippedScene.GetValueOnAnyThread() != 0)
 	{
 		const FString DumpDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("NewtonExport"));
-		FFileHelper::SaveStringToFile(Xml, *FPaths::Combine(DumpDir, TEXT("shipped_scene.xml")),
+		bool		  bWrote = FFileHelper::SaveStringToFile(Xml,
+			*FPaths::Combine(DumpDir, TEXT("shipped_scene.xml")),
 			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 		for (const TPair<FString, TArray<uint8>>& Asset : Assets)
 		{
-			FFileHelper::SaveArrayToFile(Asset.Value, *FPaths::Combine(DumpDir, Asset.Key));
+			bWrote &= FFileHelper::SaveArrayToFile(Asset.Value, *FPaths::Combine(DumpDir, Asset.Key));
 		}
-		UE_LOG(LogRammsNewton, Log,
+		// A diagnostic that reports success it did not have is worse than no
+		// diagnostic: the next person reads the line and trusts the files.
+		UE_CLOG(bWrote, LogRammsNewton, Log,
 			TEXT("[NewtonSolver] Dumped shipped scene (%d chars, %d asset(s)) to %s"),
 			Xml.Len(), Assets.Num(), *DumpDir);
+		UE_CLOG(!bWrote, LogRammsNewton, Warning,
+			TEXT("[NewtonSolver] Failed to write part of the shipped-scene dump to %s"), *DumpDir);
 	}
 
 	if (!Client.IsValid())
@@ -583,9 +609,14 @@ void URammsNewtonSolverComponent::BeginStateSync(
 
 			if (bOk)
 			{
-				// Capture the engine's current state under CallbackMutex
-				// (copy only — release the lock before the RPC so the local
-				// stepping keeps running while set_state is in flight).
+				// Capture AND inject under CallbackMutex. Releasing it between
+				// the two lets the fallback handler keep calling mj_step while
+				// set_state is in flight, so the worker is seeded from a state
+				// the engine has already moved past — and the first Newton
+				// writeback then rolls the pose back by every step taken during
+				// the RPC. Holding the lock stalls the physics thread for the
+				// duration instead, which is a hitch on a rare event rather
+				// than a silent rewind on every one.
 				TArray<double> Qpos, Qvel, Act;
 				double		   Time = -1.0;
 				if (UMjPhysicsEngine* Engine = WeakEngine.Get())
@@ -602,13 +633,10 @@ void URammsNewtonSolverComponent::BeginStateSync(
 							Act.Append(Data->act, Model->na);
 						}
 						Time = Data->time;
+						bOk = LocalClient->SetState(Qpos, Qvel, Act, Time, Unused, Error);
 					}
 				}
-				if (Time >= 0.0)
-				{
-					bOk = LocalClient->SetState(Qpos, Qvel, Act, Time, Unused, Error);
-				}
-				else
+				if (Time < 0.0)
 				{
 					bOk = false;
 					Error = TEXT("engine/model unavailable while capturing state");
@@ -667,6 +695,22 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 					UE_LOG(LogRammsNewton, Warning,
 						TEXT("[NewtonSolver] set_state seeding failed (%s) — falling back to a sim reset"),
 						*Error);
+					// Reset BOTH sides. A set_state that timed out may still have
+					// been applied, and one that failed part-way leaves the worker
+					// somewhere unknown; resetting only the engine would let the
+					// first reply overwrite the freshly reset state with that
+					// unknown one. A worker reset that itself fails is worth
+					// refusing the attach over, since nothing after it is trusted.
+					FString				   ResetError;
+					FRammsNewtonStepResult ResetState;
+					if (This->Client.IsValid() && !This->Client->ResetSim(ResetState, ResetError))
+					{
+						This->SetStatus(FString::Printf(
+							TEXT("Refusing to attach: worker reset failed after a failed seed (%s)"),
+							*ResetError));
+						This->bWantActive = false;
+						return;
+					}
 					Engine->ResetSimulation();
 					This->FinishInstall(Engine);
 					return;
@@ -693,6 +737,14 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 	bPipelineActive = URammsNewtonPhysicsSettings::Get().bPipelineSteps;
 	bPendingStepHadMocap = false;
 	StepCounter.store(0);
+	{
+		// Belongs to the installation that wrote it. Carried across an
+		// uninstall into a new session with the same nq, it would be compared
+		// against the previous run's state and request a needless sync on the
+		// very first step. Empty means "the first Advanced() establishes it".
+		FScopeLock Lock(&LastWrittenMutex);
+		LastWrittenQpos.Reset();
+	}
 	HzWindowStart = FPlatformTime::Seconds();
 	HzWindowStartCount = 0;
 
@@ -799,6 +851,11 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 							TEXT("[NewtonSolver] Worker rejected mocap data (%s) — mocap forwarding disabled"),
 							*Error);
 						bForwardMocap.store(false);
+						// The worker rejected the request before it stepped, so
+						// it is now a step behind the engine we are about to
+						// advance locally. Resume only after pushing state, or
+						// the next reply pairs a stale pose with a newer time.
+						PendingResync.store(static_cast<uint8>(EResyncRequest::SetState));
 						mj_step(Model, Data);
 						LastSteppedTime.store(Data->time);
 						return Advanced();
@@ -866,6 +923,9 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 						TEXT("[NewtonSolver] Worker rejected mocap data (%s) — mocap forwarding disabled"),
 						*Error);
 					bForwardMocap.store(false);
+					// As above: rejected before the worker stepped, so it is a
+					// step behind. Push state before resuming.
+					PendingResync.store(static_cast<uint8>(EResyncRequest::SetState));
 					mj_step(Model, Data);
 					LastSteppedTime.store(Data->time);
 					return Advanced();
@@ -894,10 +954,15 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 bool URammsNewtonSolverComponent::ValidateAndWriteback(
 	mjModel_* Model, mjData_* Data, const FRammsNewtonStepResult& Result)
 {
-	if (Result.Qpos.Num() != Model->nq || Result.Qvel.Num() != Model->nv)
+	// act is part of the state, not an optional extra: accepting a reply whose
+	// act is missing or the wrong length and then leaving Data->act alone pairs
+	// the worker's qpos/qvel with this side's stale activation.
+	if (Result.Qpos.Num() != Model->nq || Result.Qvel.Num() != Model->nv
+		|| Result.Act.Num() != Model->na)
 	{
 		SetStatus(FString::Printf(
-			TEXT("Step reply layout mismatch (qpos %d vs nq %d)"), Result.Qpos.Num(), Model->nq));
+			TEXT("Step reply layout mismatch (qpos %d vs nq %d, qvel %d vs nv %d, act %d vs na %d)"),
+			Result.Qpos.Num(), Model->nq, Result.Qvel.Num(), Model->nv, Result.Act.Num(), Model->na));
 		bStepFailed.store(true);
 		return false;
 	}
@@ -914,6 +979,13 @@ bool URammsNewtonSolverComponent::ValidateAndWriteback(
 	{
 		bFinite &= FMath::IsFinite(Value);
 	}
+	// act is copied into mjData alongside qpos/qvel, so a NaN activation poisons
+	// the dynamics just as surely; checking only the other two would let it past
+	// a function whose whole job is to refuse a diverged state.
+	for (double Value : Result.Act)
+	{
+		bFinite &= FMath::IsFinite(Value);
+	}
 	if (!bFinite)
 	{
 		SetStatus(TEXT("Worker returned non-finite state (solver diverged)"));
@@ -923,7 +995,7 @@ bool URammsNewtonSolverComponent::ValidateAndWriteback(
 
 	FMemory::Memcpy(Data->qpos, Result.Qpos.GetData(), Model->nq * sizeof(double));
 	FMemory::Memcpy(Data->qvel, Result.Qvel.GetData(), Model->nv * sizeof(double));
-	if (Model->na > 0 && Result.Act.Num() == Model->na)
+	if (Model->na > 0)
 	{
 		FMemory::Memcpy(Data->act, Result.Act.GetData(), Model->na * sizeof(double));
 	}
