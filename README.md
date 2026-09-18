@@ -65,8 +65,8 @@ Milestones from plan §5.5:
 | Milestone | State |
 |-----------|-------|
 | **A** — worker + protocol + probe + UE availability/settings | **Done.** Worker package with 27-test pytest suite; UE client/settings/subsystem; probe + canary (now liveness-checking) + liveness machinery |
-| **B** — CustomStepHandler end-to-end | **Runtime-validated, worker AND UE PIE.** Worker: qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU); contact-regime parity blocked on Newton's contact-set translation (see Known issues). UE (2026-08-07, RTX 4090): simulate session on `Map_GraspTestURL` — component binds in ~16 s warm (GPU solver, nq=42) and steps the scene through the worker |
-| **C** — lifecycle | **Core implemented; reset path runtime-validated in PIE** (`ResetSimulation()` → handler detects the time jump → worker resync in ~2 s → stepping resumes; clean deactivate + zero orphaned workers on EndPlay). Open: worker `set_state`, replay-displacement detection |
+| **B** — CustomStepHandler end-to-end | **Runtime-validated, worker AND UE PIE, including actuators.** Worker: qpos-trace parity harness (`newton_worker parity`) passes on pendulum (both solvers, ~6e-4) and fixed-base gen3_2f85 with contacts disabled (~1e-4, CPU and GPU); contact-regime parity blocked on Newton's contact-set translation (see Known issues). UE (2026-08-07 PM, RTX 4090): simulate on `Map_GraspTestURL` with the gen3_2f85 articulation BP spawned in-level — binds in ~16 s warm (GPU, **nq=64 nu=8 nmocap=1**) and stepped continuously for 3+ min with live ctrl forwarding (EE-IK position actuators + tendon gripper), mocap forwarding (tracking-base weld target), and contact. Scripted grasp choreography ran end-to-end (approach/close/lift); the grasp itself doesn't hold — free objects slide under Newton's contact translation (measured ~3 mm/s resting drift in-editor; the Milestone E upstream blocker), NOT a bridge issue |
+| **C** — lifecycle | **Core implemented; reset path runtime-validated in PIE** (`ResetSimulation()` → handler detects the time jump → worker resync in ~2 s → stepping resumes; clean deactivate + zero orphaned workers on EndPlay). Worker `set_state` implemented + e2e-tested 2026-08-07 (original-layout qpos/qvel/act/time; scatters through the interchange maps, resyncs the newton State via `_update_newton_state` so the next step's `_update_mjc_data` push keeps the injection, zeroes `qacc_warmstart`). Open: UE-side snapshot-restore consumption, replay-displacement detection |
 | **D** — editor tooling | **First cut done** (three menu actions). Open: toolbar status pill (worker alive / solver / achieved Hz), per-manager backend selector UX |
 | **E** — fleet mirror + gen3_2f85 grasp under Newton | Not started |
 
@@ -76,8 +76,10 @@ Lifecycle semantics implemented in `URammsNewtonSolverComponent` (v1):
   asynchronously (v1 reset = full model rebuild), then resumes. The few
   locally-stepped frames cause a bounded divergence reconciled by the first
   writeback.
-- **Snapshot restore** (mid-run time jump): deactivates cleanly — restoring an
-  arbitrary state into the worker needs the not-yet-implemented `set_state`.
+- **Snapshot restore** (mid-run time jump): deactivates cleanly. The worker
+  now implements `set_state` (original-layout qpos/qvel/act/time), so the
+  remaining work is UE-side: forward the restored mjData state instead of
+  deactivating.
 - **Mid-run activation**: the worker starts from the model's initial state, so
   the component auto-resets the sim on attach (`bResetSimOnActivate`, default
   on) or refuses.
@@ -158,6 +160,32 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
   attributes** in robot MJCFs — newton's importer disagrees with MuJoCo
   about geom-derived inertials (visual geoms) and mis-parses single-value
   solref as `[t, 0]`. Both bit us on gen3_2f85 (fixed in `mujoco/gen3_2f85/`).
+  **Source-side fixes are NOT enough for the UE path**: URLab's compiled-spec
+  re-export (mj_saveXML) re-compacts every `solref*`/`solimp*` to the shortest
+  form (drops trailing built-in-default components), and newton v1.5.0rc2 pads
+  single-value solref but passes PARTIAL `solimp` (e.g. `"0.98 0.999"`, 2 of 5)
+  through unpadded → solimp width/mid/power = 0 → mujoco-warp divide-by-zero →
+  the whole sim NaNs within 3 GPU steps (CPU fine, plain MuJoCo fine). The
+  worker now pads all six attrs to canonical length before `add_mjcf`
+  (`normalize_sol_shorthand` in `sim.py`) — upstream fix belongs in newton's
+  `parse_vec` (extend the shorthand whitelist to solimp keys).
+- **mujoco-warp constraint-buffer overflow is an illegal memory access
+  (CUDA 700 in `_qfrc_constraint_from_grad`), not an error** — buffers are
+  sized from the *initial* state (`TODO find better heuristics` upstream), so
+  a scene that loads and liveness-checks fine crashes the first time the arm
+  sweeps into contact. The worker now defaults `nconmax`/`njmax` to
+  worst-case sizes scaled by shape count (overridable via `solver_options`).
+- **SolverMuJoCo's re-export can append mocap bodies of its own** (observed:
+  nmocap 1 → 2 on the gen3 scene). Mocap data crosses the wire in the
+  ORIGINAL model's layout and the worker scatters it through a name-matched
+  index map (built next to the qpos map; unmappable ⇒ step raises a "mocap"
+  error, which the UE client treats as "disable mocap forwarding", not fatal).
+- **Debug aid**: set `RAMMS_NEWTON_DUMP_DIR=<dir>` in the editor's
+  environment (works via remote-exec `os.environ`) and every `load_model`
+  payload is saved as `model.xml` + assets — reproduce any in-editor scene
+  with the CLI/pytest in seconds. The step handler also refuses to write
+  non-finite worker state back into URLab (deactivates with "solver
+  diverged" instead of silently poisoning sensors/publishers).
 - **The worker's stdout/stderr pipe MUST be drained continuously** — UE's
   `CreateProc` routes both into one pipe, and a full pipe buffer blocks the
   worker mid-`write` (observed 2026-08-07: trimesh's per-mesh warnings during
@@ -182,16 +210,25 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
 
 ## Pickup checklist (next work, in order)
 
-1. ~~Validate Milestone B/C in PIE~~ **DONE 2026-08-07** (simulate session on
+1. ~~Validate Milestone B/C in PIE~~ **DONE 2026-08-07** (simulate on
    `Map_GraspTestURL`: bind ~16 s warm, GPU solver, reset resync ~2 s, clean
-   teardown; the session also flushed out and fixed the pipe-backpressure
-   deadlock — see Known issues). Remaining B/C validation nuance: that scene
-   has nu=0 (URLab drives it via mocap/EE controller), so PIE ctrl-forwarding
-   is exercised only by the CLI parity harness so far — worth a follow-up on
-   an actuator-driven scene.
-2. Worker `set_state` (protocol op exists, returns not_implemented) — unlocks
-   snapshot restore and divergence-free reset/attach. Needs engine-side state
-   injection semantics validated against SolverMuJoCo internals.
+   teardown; flushed out and fixed the pipe-backpressure deadlock).
+   ~~Actuator-driven follow-up~~ **DONE 2026-08-07 PM**: gen3_2f85 BP spawned
+   in-level (the map itself places no arm — it arrives with the play-time
+   pawn, which `editor_play_simulate()` never spawns; that was the earlier
+   "nu=0" reading). nq=64 nu=8 scene stepped 3+ min under Newton with live
+   EE-IK ctrl + gripper + mocap forwarding. Flushed out and fixed three more
+   bugs (solimp re-compaction NaN, mocap layout map, constraint-buffer
+   CUDA 700 — see Known issues). Grasp itself is gated on the upstream
+   contact-translation issue (can slides ~3 mm/s at rest in-editor). NOTE:
+   the gen3_2f85 BP asset predates the 08-06 MJCF fidelity fixes — reimport
+   from `mujoco/gen3_2f85/gen3_2f85_scene_ue.xml` is still pending (parity
+   fidelity, not correctness).
+2. ~~Worker `set_state`~~ **worker side DONE 2026-08-07** (e2e-tested on
+   GPU: exact readback, injected state is dynamically live, warm-start
+   invalidated). Remaining: UE-side consumption — snapshot restore and
+   divergence-free reset/attach in `URammsNewtonSolverComponent` (send the
+   current mjData state instead of ResetSim/deactivate).
 3. Milestone D remainder: toolbar status pill, backend selector.
 4. Milestone E: `ramms_newton_fleet_mirror.py` (URLab Puppet-mode viewer for
    multi-env fleets) + gen3_2f85 grasp test under Newton — gated on the
@@ -199,6 +236,10 @@ provides the libzmq this plugin links), plus **Python 3.11+**.
 5. Upstream: file (a) the mujoco-warp sm_120 mesh-CCD crash (fixed in 3.11,
    affects 3.10.x users), (b) newton importer single-value `solreflimit`
    mis-parse, (c) newton contact-set translation divergence, (d) the warp
-   compiler bug report from the old machine (repro in `Scripts/README.md`);
+   compiler bug report from the old machine (repro in `Scripts/README.md`),
+   (e) newton importer passes partial `solimp` vectors through unpadded
+   (NaN via divide-by-zero; extend `parse_vec`'s shorthand whitelist),
+   (f) mujoco-warp constraint-buffer overflow is an unchecked illegal memory
+   access instead of an error;
    candidates for URLab PRs: `OnModelCompiled` delegate, step-handler
    arbitration.

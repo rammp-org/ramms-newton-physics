@@ -19,6 +19,7 @@ in-place reset/set_state lands with the lifecycle milestone.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import tempfile
@@ -27,9 +28,59 @@ from typing import Any
 
 import numpy as np
 
+log = logging.getLogger(__name__)
+
 SOLVER_MUJOCO = "mujoco"
 SOLVER_MUJOCO_CPU = "mujoco_cpu"
 SUPPORTED_SOLVERS = (SOLVER_MUJOCO, SOLVER_MUJOCO_CPU)
+
+# MuJoCo built-in defaults for the solver-parameter attributes whose XML form
+# may be truncated: mj_saveXML drops trailing components that equal these
+# defaults (e.g. the common ``solimp="0.98 0.999"`` is 2 of 5 components).
+# MuJoCo re-parses that shorthand fine, but newton's MJCF importer passes
+# partial vectors through unpadded — solimp width/midpoint/power become 0 and
+# mujoco-warp divides by zero, so the whole sim goes NaN within a few steps.
+# Padding here (instead of patching newton) protects every entry path: the
+# UE-serialized scene, CLI parity runs, and hand-written models.
+_SOLREF_DEFAULT = (0.02, 1.0)
+_SOLIMP_DEFAULT = (0.9, 0.95, 0.001, 0.5, 2.0)
+_SOL_PAD_DEFAULTS = {
+    "solref": _SOLREF_DEFAULT,
+    "solreflimit": _SOLREF_DEFAULT,
+    "solreffriction": _SOLREF_DEFAULT,
+    "solimp": _SOLIMP_DEFAULT,
+    "solimplimit": _SOLIMP_DEFAULT,
+    "solimpfriction": _SOLIMP_DEFAULT,
+}
+
+
+def normalize_sol_shorthand(mjcf_xml: str) -> str:
+    """Pad truncated solref*/solimp* attributes to canonical length.
+
+    Trailing components come from MuJoCo's built-in defaults, which is exactly
+    what mj_saveXML elided, so this reconstructs the full-length form the
+    newton importer needs. Returns the XML unchanged when nothing is padded.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(mjcf_xml)
+    except ET.ParseError:
+        return mjcf_xml  # let the compiler produce the real error message
+    padded = 0
+    for el in root.iter():
+        for key, default in _SOL_PAD_DEFAULTS.items():
+            raw = el.attrib.get(key)
+            if raw is None:
+                continue
+            vals = raw.split()
+            if 0 < len(vals) < len(default):
+                vals += [repr(v) for v in default[len(vals):]]
+                el.set(key, " ".join(vals))
+                padded += 1
+    if not padded:
+        return mjcf_xml
+    return ET.tostring(root, encoding="unicode")
 
 
 class SimError(Exception):
@@ -45,6 +96,8 @@ class NewtonSim:
         self._scene_dir: str | None = None
         self.sim_time = 0.0
         self.step_count = 0
+        self._step_graph = None
+        self._graph_capture_failed = False
 
     # ------------------------------------------------------------------ load
 
@@ -78,7 +131,7 @@ class NewtonSim:
         # asset references from the XML.
         self._scene_dir = tempfile.mkdtemp(prefix="ramms_newton_scene_")
         scene_path = Path(self._scene_dir) / "scene.xml"
-        scene_path.write_text(mjcf_xml, encoding="utf-8")
+        scene_path.write_text(normalize_sol_shorthand(mjcf_xml), encoding="utf-8")
         for rel_path, data in (assets or {}).items():
             asset_path = Path(self._scene_dir) / rel_path
             if not asset_path.resolve().is_relative_to(Path(self._scene_dir).resolve()):
@@ -93,6 +146,24 @@ class NewtonSim:
                 builder = newton.ModelBuilder()
                 builder.add_mjcf(str(scene_path), ctrl_direct=True)
                 self.model = builder.finalize()
+                if solver == SOLVER_MUJOCO:
+                    # mujoco-warp sizes its constraint/contact buffers from
+                    # the INITIAL state ("TODO find better heuristics"
+                    # upstream) and overflowing them is an illegal memory
+                    # access (CUDA 700), not an error — a scene that loads
+                    # fine crashes the first time an articulated arm sweeps
+                    # into contact. Size for the worst case up front; a few
+                    # MB of GPU memory buys crash-free contact bursts.
+                    nshape = int(getattr(self.model, "shape_count", 0) or 0)
+                    options.setdefault("nconmax", max(4096, 32 * nshape))
+                    options.setdefault("njmax", max(4 * options["nconmax"], 16384))
+                    # mjw_data is our sole authoritative state (set_state and
+                    # mocap write it directly; read_state reads it). Disabling
+                    # the per-step Newton-state -> mjw_data sync removes a lossy
+                    # roundtrip AND is required for CUDA-graph stepping: the
+                    # graph bakes array pointers, so the state_0/state_1
+                    # ping-pong must not feed back into the solver.
+                    options.setdefault("update_data_interval", 0)
                 self.solver = newton.solvers.SolverMuJoCo(
                     self.model,
                     use_mujoco_cpu=(solver == SOLVER_MUJOCO_CPU),
@@ -234,6 +305,49 @@ class NewtonSim:
                 "(unsupported MJCF actuator type?)"
             )
 
+        # Mocap: the re-export may append mocap bodies of its own (and
+        # prefixes body names), so incoming mocap data — always in ORIGINAL
+        # layout — must be scattered through an index map. Built best-effort:
+        # an unmappable mocap body records the reason and _apply_mocap raises
+        # a "mocap" SimError, which the UE client treats as "disable mocap
+        # forwarding" rather than a fatal step failure.
+        self._mocap_map: np.ndarray | None = None
+        self._mocap_map_error = ""
+        if int(ref.nmocap) > 0:
+
+            def mocap_bodies(m):
+                out = {}
+                for bi in range(m.nbody):
+                    mid = int(m.body_mocapid[bi])
+                    if mid >= 0:
+                        out[mid] = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, bi) or ""
+                return out
+
+            ref_mocap = mocap_bodies(ref)
+            sol_mocap = mocap_bodies(sol)
+            mocap_idx = np.empty(int(ref.nmocap), dtype=np.int64)
+            try:
+                for mid in range(int(ref.nmocap)):
+                    rname = ref_mocap.get(mid, "")
+                    if not rname:
+                        raise SimError(f"original mocap body {mid} is unnamed")
+                    matches = [
+                        smid
+                        for smid, sname in sol_mocap.items()
+                        if sname == rname
+                        or sname.endswith("_" + rname)
+                        or sname.endswith("/" + rname)
+                    ]
+                    if len(matches) != 1:
+                        raise SimError(
+                            f"cannot map mocap body '{rname}' onto the solver model "
+                            f"({len(matches)} candidates among {sorted(sol_mocap.values())})"
+                        )
+                    mocap_idx[mid] = matches[0]
+                self._mocap_map = mocap_idx
+            except SimError as exc:
+                self._mocap_map_error = str(exc)
+
     # ------------------------------------------------------------------ info
 
     def describe(self) -> dict[str, Any]:
@@ -287,14 +401,56 @@ class NewtonSim:
 
         try:
             for _ in range(nsteps):
-                self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
-                self.state_0, self.state_1 = self.state_1, self.state_0
+                if not self._graph_step():
+                    self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.dt)
+                    self.state_0, self.state_1 = self.state_1, self.state_0
         except Exception as exc:
             raise SimError(f"step failed: {type(exc).__name__}: {exc}") from exc
 
         self.step_count += nsteps
         self.sim_time += nsteps * self.dt
         return self.read_state()
+
+    def _graph_step(self) -> bool:
+        """Advance one substep by CUDA-graph replay; False = caller steps eagerly.
+
+        Single-env mujoco-warp is kernel-launch-latency-bound: an eager
+        solver.step costs ~10 ms in Python/launch overhead regardless of model
+        size, which capped the UE bridge near 0.2x realtime. Replaying the
+        step as a captured CUDA graph is the standard mjwarp pattern and cuts
+        that to well under a millisecond.
+
+        Correctness rests on update_data_interval=0 (set at load): mjw_data is
+        the sole authoritative state, ctrl/mocap/set_state all write into
+        arrays the graph reads by pointer, and the Newton states are dead
+        outputs — so one captured launch sequence stays valid for the life of
+        the model. Any capture failure (sync inside the step path, older warp)
+        permanently falls back to eager stepping for this model.
+        """
+        if self.solver_name != SOLVER_MUJOCO or self._graph_capture_failed:
+            return False
+        if self.step_count == 0:
+            # First step after a (re)build runs eagerly: it flushes the
+            # solver's lazy one-time work so none of it gets baked into the
+            # capture.
+            return False
+
+        import warp as wp
+
+        if self._step_graph is None:
+            try:
+                with wp.ScopedDevice(self.model.device):
+                    with wp.ScopedCapture() as capture:
+                        self.solver.step(
+                            self.state_0, self.state_1, self.control, self.contacts, self.dt
+                        )
+                self._step_graph = capture.graph
+            except Exception:
+                log.exception("CUDA graph capture failed; stepping eagerly")
+                self._graph_capture_failed = True
+                return False
+        wp.capture_launch(self._step_graph)
+        return True
 
     def _live_mjw_data(self):
         """The warp-side data ONLY when the solver actually steps it.
@@ -309,21 +465,44 @@ class NewtonSim:
         return getattr(self.solver, "mjw_data", None)
 
     def _apply_mocap(self, mocap_pos, mocap_quat) -> None:
-        mj_model = self.solver.mj_model
-        nmocap = int(mj_model.nmocap)
-        if nmocap == 0:
+        """Scatter ORIGINAL-layout mocap data into the solver model.
+
+        The solver's re-export can hold more mocap bodies than the original
+        (its own additions keep their model defaults); ``_mocap_map`` gives
+        original index -> solver index. Every error message here contains
+        "mocap" — the UE client keys on that to gracefully drop mocap
+        forwarding instead of failing the whole backend.
+        """
+        ref_nmocap = int(self.ref_model.nmocap)
+        if ref_nmocap == 0:
             raise SimError("model has no mocap bodies")
+        if self._mocap_map is None:
+            raise SimError(f"mocap forwarding unavailable: {self._mocap_map_error}")
+        idx = self._mocap_map
+        sol_nmocap = int(self.solver.mj_model.nmocap)
         mjw_data = self._live_mjw_data()
         if mocap_pos is not None:
-            pos = np.asarray(mocap_pos, dtype=np.float64).reshape(nmocap, 3)
+            pos = np.asarray(mocap_pos, dtype=np.float64).reshape(-1, 3)
+            if pos.shape[0] != ref_nmocap:
+                raise SimError(
+                    f"mocap_pos has {pos.shape[0]} bodies, model has nmocap={ref_nmocap}"
+                )
+            full = np.array(self.solver.mj_data.mocap_pos, dtype=np.float64).reshape(sol_nmocap, 3)
+            full[idx] = pos
             if mjw_data is not None:
-                mjw_data.mocap_pos.assign(pos.reshape(1, nmocap, 3).astype(np.float32))
-            self.solver.mj_data.mocap_pos[:] = pos
+                mjw_data.mocap_pos.assign(full.reshape(1, sol_nmocap, 3).astype(np.float32))
+            self.solver.mj_data.mocap_pos[:] = full
         if mocap_quat is not None:
-            quat = np.asarray(mocap_quat, dtype=np.float64).reshape(nmocap, 4)
+            quat = np.asarray(mocap_quat, dtype=np.float64).reshape(-1, 4)
+            if quat.shape[0] != ref_nmocap:
+                raise SimError(
+                    f"mocap_quat has {quat.shape[0]} bodies, model has nmocap={ref_nmocap}"
+                )
+            full = np.array(self.solver.mj_data.mocap_quat, dtype=np.float64).reshape(sol_nmocap, 4)
+            full[idx] = quat
             if mjw_data is not None:
-                mjw_data.mocap_quat.assign(quat.reshape(1, nmocap, 4).astype(np.float32))
-            self.solver.mj_data.mocap_quat[:] = quat
+                mjw_data.mocap_quat.assign(full.reshape(1, sol_nmocap, 4).astype(np.float32))
+            self.solver.mj_data.mocap_quat[:] = full
 
     def read_state(self) -> dict[str, Any]:
         """qpos/qvel/act in the ORIGINAL MJCF's ordering (see _build_interchange_map)."""
@@ -346,6 +525,64 @@ class NewtonSim:
             "act": [float(v) for v in act],
         }
 
+    def set_state(self, qpos=None, qvel=None, act=None, time=None) -> dict[str, Any]:
+        """Inject qpos/qvel/act (ORIGINAL MJCF layout) into the running solver.
+
+        Write path mirrors read_state's permutation, plus two subtleties:
+        SolverMuJoCo.step pushes the newton ``State`` into mj(w)_data every
+        step (``_update_mjc_data``), so after writing the mjc arrays we must
+        resync the newton state FROM them (``_update_newton_state``) or the
+        write is clobbered on the next step; and a state jump invalidates
+        MuJoCo's solver warm-start, so ``qacc_warmstart`` is zeroed.
+        """
+        self._require_loaded()
+        ref = self.ref_model
+        mj_data = self.solver.mj_data
+        mjw_data = self._live_mjw_data()
+
+        def scatter(target_name, values, idx, expected, label):
+            arr = np.asarray(values, dtype=np.float64).ravel()
+            if arr.size != expected:
+                raise SimError(f"{label} has {arr.size} values, model has {expected}")
+            cpu = np.array(getattr(mj_data, target_name), dtype=np.float64).ravel()
+            if idx is None:
+                cpu[:] = arr
+            else:
+                cpu[idx] = arr
+            getattr(mj_data, target_name)[:] = cpu.reshape(getattr(mj_data, target_name).shape)
+            if mjw_data is not None:
+                getattr(mjw_data, target_name).assign(
+                    cpu.reshape((1,) + cpu.shape).astype(np.float32)
+                )
+
+        try:
+            if qpos is not None:
+                scatter("qpos", qpos, self._qpos_idx, int(ref.nq), "qpos")
+            if qvel is not None:
+                scatter("qvel", qvel, self._qvel_idx, int(ref.nv), "qvel")
+            if act is not None and int(ref.na) > 0:
+                scatter("act", act, None, int(ref.na), "act")
+            if time is not None:
+                self.sim_time = float(time)
+
+            # Invalidate warm-start at the injected state.
+            mj_data.qacc_warmstart[:] = 0
+            if mjw_data is not None and hasattr(mjw_data, "qacc_warmstart"):
+                mjw_data.qacc_warmstart.zero_()
+
+            # Resync the newton State from the mjc data so the next step's
+            # _update_mjc_data pushes the injected state, not the stale one.
+            data = mjw_data if mjw_data is not None else mj_data
+            self.solver._update_newton_state(
+                self.model, self.state_1, data, state_prev=self.state_0
+            )
+            self.state_0, self.state_1 = self.state_1, self.state_0
+        except SimError:
+            raise
+        except Exception as exc:
+            raise SimError(f"set_state failed: {type(exc).__name__}: {exc}") from exc
+        return self.read_state()
+
     # ----------------------------------------------------------------- reset
 
     def reset(self) -> dict[str, Any]:
@@ -360,6 +597,8 @@ class NewtonSim:
 
     def close(self) -> None:
         self._loaded = False
+        self._step_graph = None
+        self._graph_capture_failed = False
         for attr in ("solver", "model", "state_0", "state_1", "control", "contacts"):
             if hasattr(self, attr):
                 delattr(self, attr)

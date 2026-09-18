@@ -49,7 +49,7 @@ slams stiff servos into force saturation where tiny model differences
 amplify chaotically. Recorded artifacts live in `parity_artifacts/`.
 
 Protocol: ZMQ REQ/REP, msgpack (JSON accepted; replies mirror the request
-codec). Ops: `hello`, `load_model`, `step`, `reset`, `set_state` (reserved),
+codec). Ops: `hello`, `load_model`, `step`, `reset`, `set_state`,
 `shutdown`. See `newton_worker/protocol.py`.
 
 ## Tests

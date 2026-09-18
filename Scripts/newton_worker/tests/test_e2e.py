@@ -209,3 +209,26 @@ def test_bad_mjcf_is_load_failed_and_recoverable(loaded):
     # The worker must survive a failed load and accept a good one afterwards.
     reply = worker.request("load_model", {"mjcf_xml": PENDULUM_MJCF, "solver": SOLVER})
     assert reply["ok"], reply
+
+
+def test_set_state_readback_and_dynamics(loaded):
+    worker, _ = loaded
+    worker.request("reset")
+    # Inject a raised pendulum with zero velocity at a chosen sim time.
+    reply = worker.request("set_state", {"qpos": [0.6], "qvel": [0.0], "time": 5.0})
+    assert reply["ok"], reply
+    state = reply["result"]
+    assert state["qpos"][0] == pytest.approx(0.6, abs=1e-3)
+    assert state["qvel"][0] == pytest.approx(0.0, abs=1e-3)
+    assert state["time"] == pytest.approx(5.0)
+    # The injected state must be dynamically live: unactuated, the raised rod
+    # swings down (not frozen at 0.6, not reverted to the pre-set state).
+    state = worker.request("step", {"nsteps": 100})["result"]
+    assert state["qpos"][0] < 0.55, f"rod did not swing down from injected pose: {state['qpos'][0]}"
+    assert state["time"] == pytest.approx(5.2)
+
+
+def test_set_state_length_mismatch_is_step_failed(loaded):
+    worker, _ = loaded
+    reply = worker.request("set_state", {"qpos": [0.1, 0.2]})
+    assert not reply["ok"] and reply["error"]["code"] == protocol.ERR_STEP_FAILED
