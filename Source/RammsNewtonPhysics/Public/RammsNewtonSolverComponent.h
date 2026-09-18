@@ -76,12 +76,20 @@ public:
 	FRammsNewtonModelInfo GetModelInfo() const { return ModelInfo; }
 
 	/**
-	 * Serialize the engine's compiled model (mj_saveXMLString on the live
-	 * mjSpec, asset references flattened to bare filenames) plus the VFS
-	 * asset blobs — the exact payload the worker's load_model expects and the
-	 * scene-export artifact for headless training (plan §5.4). Takes the
-	 * engine's CallbackMutex briefly. Also used by the editor module
+	 * Serialize the engine's compiled scene plus its VFS blobs — the exact
+	 * payload the worker's load_model expects, and the scene-export artifact
+	 * for headless training (plan §5.4). Also used by the editor module
 	 * (validate / export actions).
+	 *
+	 * Sourced from UMjPhysicsEngine::BuildCompiledScene, which is the same
+	 * place the bridge handshake's `mjcf_compiled` comes from, so the worker
+	 * sees exactly what a remote client would. That hands back the MJCF the
+	 * compiler was given rather than a re-serialisation of the model, which
+	 * matters because a scene may reference participant specs by VFS name:
+	 * re-serialising would flatten that structure away. Participants travel
+	 * as assets under the names the scene references them by, alongside the
+	 * asset files, with every file= reference flattened to a bare filename
+	 * for the worker's flat scene directory.
 	 */
 	static bool SerializeCompiledModel(
 		UMjPhysicsEngine*			  Engine,

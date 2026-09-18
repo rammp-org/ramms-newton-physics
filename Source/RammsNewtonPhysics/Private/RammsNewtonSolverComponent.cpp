@@ -130,8 +130,9 @@ void URammsNewtonSolverComponent::TickComponent(
 		return; // manager not up / model not compiled yet — keep waiting
 	}
 
-	AAMjManager* Manager = AAMjManager::GetManager();
-	if (Manager && Manager->EffectiveStepMode.load() != EStepMode::Live)
+	// Beta resolves Auto -> Live/Direct/Puppet on the engine; the manager only
+	// carries the authored preference, so asking it would miss the resolution.
+	if (Engine->GetStepMode() != EStepMode::Live)
 	{
 		SetStatus(TEXT("Manager is in Direct/Puppet step mode — Newton requires Live mode"));
 		return;
@@ -214,74 +215,83 @@ void URammsNewtonSolverComponent::TickComponent(
 	}
 }
 
-bool URammsNewtonSolverComponent::SerializeCompiledModel(
-	UMjPhysicsEngine* Engine, FString& OutXml, TMap<FString, TArray<uint8>>& OutAssets, FString& OutError)
+namespace
 {
+	/**
+	 * Rewrite `file="some/dir/name.ext"` to `file="name.ext"`.
+	 *
+	 * The worker writes every asset flat into one scene directory, so a
+	 * reference carrying a directory would not resolve there. This is the same
+	 * transform URLab's own bridge applies before shipping a scene.
+	 */
+	void FlattenAssetPaths(FString& Xml)
 	{
-		// Brief lock: keep the physics loop from stepping while we read the spec.
-		FScopeLock Lock(&Engine->CallbackMutex);
-		mjSpec*	   Spec = Engine->GetSpec();
-		if (!Spec)
-		{
-			OutError = TEXT("engine has no mjSpec");
-			return false;
-		}
-
-		// Two-pass growing buffer, mirroring URLab's handshake serializer.
-		TArray<uint8> XmlBuf;
-		for (int32 Capacity = 256 * 1024; Capacity <= 32 * 1024 * 1024; Capacity *= 2)
-		{
-			XmlBuf.SetNumUninitialized(Capacity);
-			FMemory::Memzero(XmlBuf.GetData(), Capacity);
-			char	  SaveError[1024] = "";
-			const int XmlResult = mj_saveXMLString(
-				Spec, reinterpret_cast<char*>(XmlBuf.GetData()), Capacity, SaveError, sizeof(SaveError));
-			if (XmlResult == 0)
-			{
-				OutXml = UTF8_TO_TCHAR(reinterpret_cast<const char*>(XmlBuf.GetData()));
-				break;
-			}
-			const FString Error = UTF8_TO_TCHAR(SaveError);
-			if (!Error.Contains(TEXT("buffer"), ESearchCase::IgnoreCase))
-			{
-				OutError = FString::Printf(TEXT("mj_saveXMLString failed: %s"), *Error);
-				return false;
-			}
-		}
-	}
-	if (OutXml.IsEmpty())
-	{
-		OutError = TEXT("mj_saveXMLString produced no XML (model too large?)");
-		return false;
-	}
-
-	// Flatten asset references to bare filenames so the worker's scene dir
-	// (assets written flat) resolves them — same transform URLab's bridge does.
-	{
-		FString Flattened;
-		Flattened.Reserve(OutXml.Len());
+		FString				Flattened;
+		Flattened.Reserve(Xml.Len());
 		const FRegexPattern Pattern(TEXT("file=\"([^\"]*?)([^/\\\\\"]+)\""));
-		FRegexMatcher		Matcher(Pattern, OutXml);
+		FRegexMatcher		Matcher(Pattern, Xml);
 		int32				Cursor = 0;
 		while (Matcher.FindNext())
 		{
-			Flattened += OutXml.Mid(Cursor, Matcher.GetMatchBeginning() - Cursor);
+			Flattened += Xml.Mid(Cursor, Matcher.GetMatchBeginning() - Cursor);
 			Flattened += FString::Printf(TEXT("file=\"%s\""), *Matcher.GetCaptureGroup(2));
 			Cursor = Matcher.GetMatchEnding();
 		}
-		Flattened += OutXml.Mid(Cursor);
-		OutXml = MoveTemp(Flattened);
+		Flattened += Xml.Mid(Cursor);
+		Xml = MoveTemp(Flattened);
+	}
+} // namespace
+
+bool URammsNewtonSolverComponent::SerializeCompiledModel(
+	UMjPhysicsEngine* Engine, FString& OutXml, TMap<FString, TArray<uint8>>& OutAssets, FString& OutError)
+{
+	// Beta removed the engine's raw mjSpec accessor and its ActiveAssetPaths
+	// list. BuildCompiledScene replaces both, and is the same source the bridge
+	// handshake's `mjcf_compiled` comes from, so the worker now receives exactly
+	// the scene a remote client would be given. It hands back the MJCF text the
+	// compiler was actually handed rather than a re-serialisation of the model,
+	// which matters here: re-serialising flattens the participant structure away.
+	FMjCompiledScene Scene;
+	if (!Engine->BuildCompiledScene(Scene, OutError))
+	{
+		if (OutError.IsEmpty())
+		{
+			OutError = TEXT("engine could not build a compiled scene");
+		}
+		return false;
 	}
 
-	for (const FString& AssetPath : Engine->ActiveAssetPaths)
+	OutXml = Scene.Xml;
+	FlattenAssetPaths(OutXml);
+
+	// A beta scene is not always one spec. Participants are referenced by the
+	// VFS name they were mounted under, so each one has to travel with the
+	// scene or the worker's compile fails on a missing <model file=...>.
+	// Shipping them as assets puts them in the worker's flat scene dir under
+	// exactly the name the scene references.
+	for (const TPair<FString, FString>& Participant : Scene.ParticipantXml)
+	{
+		FString ParticipantXml = Participant.Value;
+		FlattenAssetPaths(ParticipantXml);
+		FTCHARToUTF8 Utf8(*ParticipantXml);
+		TArray<uint8> Bytes;
+		Bytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+		OutAssets.Add(Participant.Key, MoveTemp(Bytes));
+	}
+
+	// AssetFiles maps the name the MJCF mounts an asset under to the file it
+	// came from, so the key is what to ship it as — not the file's own name,
+	// which need not match.
+	for (const TPair<FString, FString>& Asset : Scene.AssetFiles)
 	{
 		TArray<uint8> Data;
-		if (!FFileHelper::LoadFileToArray(Data, *AssetPath))
+		if (!FFileHelper::LoadFileToArray(Data, *Asset.Value))
 		{
-			OutError = FString::Printf(TEXT("failed to read asset '%s'"), *AssetPath);
+			OutError = FString::Printf(
+				TEXT("failed to read asset '%s' (mounted as '%s')"), *Asset.Value, *Asset.Key);
 			return false;
 		}
-		OutAssets.Add(FPaths::GetCleanFilename(AssetPath), MoveTemp(Data));
+		OutAssets.Add(Asset.Key, MoveTemp(Data));
 	}
 	return true;
 }
@@ -486,12 +496,25 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 	// call back into Set/ClearCustomStepHandler (self-deadlock) — failures
 	// raise bStepFailed and Tick services them on the game thread.
 	Engine->SetCustomStepHandler(
-		[this](mjModel* Model, mjData* Data) {
+		[this, Engine](mjModel* Model, mjData* Data) -> bool {
+			// Beta's contract: return true iff this call advanced sim state,
+			// and fire OnPostStep ourselves — the engine loop only does that
+			// for the plain mj_step path, so a handler that stays silent
+			// leaves recorders and replay never notified. Every path below
+			// advances, either through Newton or the mj_step fallback.
+			const auto Advanced = [Engine, Model, Data]() -> bool {
+				if (Engine->OnPostStep)
+				{
+					Engine->OnPostStep(Model, Data);
+				}
+				return true;
+			};
+
 			if (Model != ExpectedModel.load() || bStepFailed.load() || !Client.IsValid()
 				|| PendingResync.load() != static_cast<uint8>(EResyncRequest::None))
 			{
 				mj_step(Model, Data);
-				return;
+				return Advanced();
 			}
 
 			// Detect external time changes since our last writeback: a reset
@@ -505,7 +528,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 				PendingResync.store(static_cast<uint8>(
 					bIsReset ? EResyncRequest::Reset : EResyncRequest::Unsupported));
 				mj_step(Model, Data);
-				return;
+				return Advanced();
 			}
 
 			CtrlScratch.SetNum(Model->nu, EAllowShrinking::No);
@@ -535,12 +558,12 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 						*Error);
 					bForwardMocap.store(false);
 					mj_step(Model, Data);
-					return;
+					return Advanced();
 				}
 				SetStatus(FString::Printf(TEXT("Step failed: %s"), *Error));
 				bStepFailed.store(true);
 				mj_step(Model, Data);
-				return;
+				return Advanced();
 			}
 
 			if (Result.Qpos.Num() != Model->nq || Result.Qvel.Num() != Model->nv)
@@ -549,7 +572,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 					TEXT("Step reply layout mismatch (qpos %d vs nq %d)"), Result.Qpos.Num(), Model->nq));
 				bStepFailed.store(true);
 				mj_step(Model, Data);
-				return;
+				return Advanced();
 			}
 
 			FMemory::Memcpy(Data->qpos, Result.Qpos.GetData(), Model->nq * sizeof(double));
@@ -564,6 +587,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 			// Recompute all derived quantities (sites, sensors, contacts) at
 			// Newton's state so URLab's sensors/publishers stay consistent.
 			mj_forward(Model, Data);
+			return Advanced();
 		});
 
 	bHandlerInstalled = true;
