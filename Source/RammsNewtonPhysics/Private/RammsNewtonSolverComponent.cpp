@@ -10,7 +10,16 @@
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "MuJoCo/Core/AMjManager.h"
+#include "Misc/ScopeExit.h"
 #include "MuJoCo/Core/MjPhysicsEngine.h"
+
+static TAutoConsoleVariable<int32> CVarNewtonDumpShippedScene(
+	TEXT("Ramms.Newton.DumpShippedScene"),
+	0,
+	TEXT("Write the MJCF and assets handed to the Newton worker into ")
+	TEXT("Saved/NewtonExport/ before loading. Off by default; turn on to diff ")
+	TEXT("against URLab's own Saved/URLab/scene_compiled.xml."),
+	ECVF_Default);
 #include "RammsNewtonPhysicsSettings.h"
 #include "RammsNewtonWorkerClient.h"
 
@@ -261,27 +270,10 @@ bool URammsNewtonSolverComponent::SerializeCompiledModel(
 		return false;
 	}
 
-	OutXml = Scene.Xml;
-	FlattenAssetPaths(OutXml);
-
-	// A beta scene is not always one spec. Participants are referenced by the
-	// VFS name they were mounted under, so each one has to travel with the
-	// scene or the worker's compile fails on a missing <model file=...>.
-	// Shipping them as assets puts them in the worker's flat scene dir under
-	// exactly the name the scene references.
-	for (const TPair<FString, FString>& Participant : Scene.ParticipantXml)
-	{
-		FString ParticipantXml = Participant.Value;
-		FlattenAssetPaths(ParticipantXml);
-		FTCHARToUTF8 Utf8(*ParticipantXml);
-		TArray<uint8> Bytes;
-		Bytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
-		OutAssets.Add(Participant.Key, MoveTemp(Bytes));
-	}
-
 	// AssetFiles maps the name the MJCF mounts an asset under to the file it
 	// came from, so the key is what to ship it as — not the file's own name,
-	// which need not match.
+	// which need not match. Read first: the flatten pass below needs them
+	// mounted, or a scene referencing meshes will not compile.
 	for (const TPair<FString, FString>& Asset : Scene.AssetFiles)
 	{
 		TArray<uint8> Data;
@@ -293,6 +285,93 @@ bool URammsNewtonSolverComponent::SerializeCompiledModel(
 		}
 		OutAssets.Add(Asset.Key, MoveTemp(Data));
 	}
+
+	// Newton's MJCF importer does not implement MuJoCo's <attach> / <model
+	// file=...> composition: handed such a scene it silently yields zero
+	// bodies and zero joints, and the only symptom downstream is "the model
+	// must have at least one joint". Plain MuJoCo reads the same file
+	// correctly, so this is an importer gap rather than a bad scene.
+	//
+	// URLab beta emits exactly that shape — each articulation is a participant
+	// attached into the scene — so the scene has to be flattened into a single
+	// document before it goes on the wire. Parsing it with the participants and
+	// assets mounted in a VFS, compiling, and re-serialising resolves every
+	// attach; it is the same round trip URLab performs for its own debug
+	// artifact, and the compile is not optional because MuJoCo refuses to write
+	// XML for a spec it has not compiled ("Only compiled model can be written").
+	{
+		mjVFS Vfs;
+		mj_defaultVFS(&Vfs);
+		ON_SCOPE_EXIT
+		{
+			mj_deleteVFS(&Vfs);
+		};
+
+		TArray<FTCHARToUTF8> Held;
+		Held.Reserve(Scene.ParticipantXml.Num());
+		for (const TPair<FString, FString>& Participant : Scene.ParticipantXml)
+		{
+			FString ParticipantXml = Participant.Value;
+			FlattenAssetPaths(ParticipantXml);
+			const int32 Index = Held.Emplace(*ParticipantXml);
+			mj_addBufferVFS(&Vfs, TCHAR_TO_UTF8(*Participant.Key), Held[Index].Get(), Held[Index].Length());
+		}
+		for (const TPair<FString, TArray<uint8>>& Asset : OutAssets)
+		{
+			mj_addBufferVFS(&Vfs, TCHAR_TO_UTF8(*Asset.Key), Asset.Value.GetData(), Asset.Value.Num());
+		}
+
+		FString SceneXml = Scene.Xml;
+		FlattenAssetPaths(SceneXml);
+
+		char	SpecError[1024] = {0};
+		mjSpec* Spec = mj_parseXMLString(TCHAR_TO_UTF8(*SceneXml), &Vfs, SpecError, sizeof(SpecError));
+		if (!Spec)
+		{
+			OutError = FString::Printf(TEXT("could not parse the compiled scene: %s"), UTF8_TO_TCHAR(SpecError));
+			return false;
+		}
+		ON_SCOPE_EXIT
+		{
+			mj_deleteSpec(Spec);
+		};
+
+		// Compiled purely to satisfy the writer; the model itself is discarded.
+		if (mjModel* Compiled = mj_compile(Spec, &Vfs))
+		{
+			mj_deleteModel(Compiled);
+		}
+		else
+		{
+			OutError = FString::Printf(
+				TEXT("the compiled scene did not recompile for flattening: %s"), UTF8_TO_TCHAR(mjs_getError(Spec)));
+			return false;
+		}
+
+		// Sized before the call, then once against the size MuJoCo asks for: a
+		// positive return is the length it wants, not a failure.
+		TArray<char> Buffer;
+		Buffer.SetNumZeroed(1 << 16);
+		char  SaveError[1024] = {0};
+		int32 Result = mj_saveXMLString(Spec, Buffer.GetData(), Buffer.Num(), SaveError, sizeof(SaveError));
+		if (Result > 0)
+		{
+			Buffer.SetNumZeroed(Result + 1);
+			Result = mj_saveXMLString(Spec, Buffer.GetData(), Buffer.Num(), SaveError, sizeof(SaveError));
+		}
+		if (Result != 0)
+		{
+			OutError = FString::Printf(TEXT("could not flatten the compiled scene: %s"), UTF8_TO_TCHAR(SaveError));
+			return false;
+		}
+		OutXml = UTF8_TO_TCHAR(Buffer.GetData());
+	}
+	if (OutXml.IsEmpty())
+	{
+		OutError = TEXT("flattening produced no XML");
+		return false;
+	}
+
 	return true;
 }
 
@@ -308,6 +387,25 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 		SetStatus(FString::Printf(TEXT("Model serialization failed: %s"), *Error));
 		bWantActive = false;
 		return;
+	}
+
+
+	// What we actually put on the wire, written next to the engine's own
+	// scene_compiled.xml so the two can be diffed. A model that loads in the
+	// worker standalone but fails through the bridge is a shipping bug, and
+	// without this the only evidence is the worker's error text.
+	if (CVarNewtonDumpShippedScene.GetValueOnAnyThread() != 0)
+	{
+		const FString DumpDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("NewtonExport"));
+		FFileHelper::SaveStringToFile(Xml, *FPaths::Combine(DumpDir, TEXT("shipped_scene.xml")),
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		for (const TPair<FString, TArray<uint8>>& Asset : Assets)
+		{
+			FFileHelper::SaveArrayToFile(Asset.Value, *FPaths::Combine(DumpDir, Asset.Key));
+		}
+		UE_LOG(LogRammsNewton, Log,
+			TEXT("[NewtonSolver] Dumped shipped scene (%d chars, %d asset(s)) to %s"),
+			Xml.Len(), Assets.Num(), *DumpDir);
 	}
 
 	if (!Client.IsValid())
