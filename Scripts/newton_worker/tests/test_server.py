@@ -36,6 +36,12 @@ class FakeSim:
             raise SimError("no model loaded")
         return {"time": 0.0, "step_count": 0, "qpos": [0.0], "qvel": [0.0], "act": []}
 
+    def set_state(self, qpos=None, qvel=None, act=None, time=None):
+        if not self._loaded:
+            raise SimError("no model loaded")
+        return {"time": time or 0.0, "step_count": 0,
+                "qpos": qpos or [0.0], "qvel": qvel or [0.0], "act": act or []}
+
     def close(self):
         self._loaded = False
 
@@ -102,8 +108,8 @@ def test_unknown_op_and_bad_request(server):
     assert reply["error"]["code"] == protocol.ERR_BAD_REQUEST
 
 
-def test_set_state_not_implemented(server):
-    assert request(server, "set_state")["error"]["code"] == protocol.ERR_NOT_IMPLEMENTED
+def test_set_state_without_model_is_no_model(server):
+    assert request(server, "set_state", {"qpos": [0.0]})["error"]["code"] == protocol.ERR_NO_MODEL
 
 
 def test_shutdown_sets_flag_and_closes(server):

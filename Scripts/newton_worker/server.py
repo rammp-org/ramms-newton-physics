@@ -72,6 +72,7 @@ class WorkerServer:
         if not isinstance(mjcf_xml, str) or not mjcf_xml.strip():
             raise SimError("load_model requires non-empty 'mjcf_xml'")
         assets = self._decode_assets(params.get("assets"))
+        self._maybe_dump(mjcf_xml, assets)
         return self.sim.load(
             mjcf_xml,
             assets=assets,
@@ -91,12 +92,44 @@ class WorkerServer:
         return self.sim.reset()
 
     def _op_set_state(self, params: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError("set_state lands with the lifecycle milestone")
+        return self.sim.set_state(
+            qpos=params.get("qpos"),
+            qvel=params.get("qvel"),
+            act=params.get("act"),
+            time=params.get("time"),
+        )
 
     def _op_shutdown(self, params: dict[str, Any]) -> dict[str, Any]:
         self.shutdown_requested = True
         self.sim.close()
         return {"shutting_down": True}
+
+    @staticmethod
+    def _maybe_dump(mjcf_xml: str, assets: dict[str, bytes]) -> None:
+        """Debug aid: RAMMS_NEWTON_DUMP_DIR=<dir> saves each load_model payload
+        (model.xml + assets/) so a failing in-editor scene can be reproduced
+        with the CLI (`newton_worker parity --mjcf <dir>/model.xml`)."""
+        import os
+
+        root = os.environ.get("RAMMS_NEWTON_DUMP_DIR")
+        if not root:
+            return
+        try:
+            import time
+
+            out = os.path.join(root, time.strftime("load_%Y%m%d_%H%M%S"))
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, "model.xml"), "w", encoding="utf-8") as f:
+                f.write(mjcf_xml)
+            for path, data in assets.items():
+                # Keys are the flattened file="..." basenames; keep them next to
+                # model.xml so MjModel.from_xml_path resolves them unchanged.
+                dest = os.path.join(out, os.path.basename(path))
+                with open(dest, "wb") as f:
+                    f.write(data)
+            log.info("dumped load_model payload to %s", out)
+        except OSError:
+            log.exception("RAMMS_NEWTON_DUMP_DIR dump failed")
 
     @staticmethod
     def _decode_assets(raw: Any) -> dict[str, bytes]:
