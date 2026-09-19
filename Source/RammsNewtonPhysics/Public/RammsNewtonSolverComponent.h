@@ -164,8 +164,30 @@ private:
 		/** d->time jumped mid-run (snapshot restore) — worker set_state injection. */
 		SetState = 2,
 	};
-	std::atomic<uint8> PendingResync{ 0 };
-	bool			   bResyncInFlight = false;
+	/**
+	 * Packed request: low 8 bits an EResyncRequest, high 24 a counter bumped by
+	 * every raise. The kind alone cannot tell "still the request I am
+	 * servicing" from "a fresh one of the same kind arrived while I was gone",
+	 * and the completion clears by compare-exchange -- so without the counter a
+	 * second reset raised mid-RPC would be cleared unserviced, and the next
+	 * writeback would push the pre-reset pose back into the engine.
+	 *
+	 * The counter wraps at 2^24; a collision needs exactly 16.7M intervening
+	 * raises during one RPC, and raises are edge-triggered (one per observed
+	 * discontinuity, not one per step).
+	 */
+	std::atomic<uint32> PendingResync{ 0 };
+	bool				bResyncInFlight = false;
+
+	static constexpr uint32 ResyncCountShift = 8;
+
+	static EResyncRequest ResyncKind(uint32 Packed)
+	{
+		return static_cast<EResyncRequest>(Packed & 0xFFu);
+	}
+
+	/** Raise a resync from the step handler, never weakening a pending Reset. */
+	void RaiseResync(EResyncRequest Kind);
 
 	/** Bumped by every install. A resync completion carries the generation it
 	 *  started in and does nothing if that no longer matches, so a reply
