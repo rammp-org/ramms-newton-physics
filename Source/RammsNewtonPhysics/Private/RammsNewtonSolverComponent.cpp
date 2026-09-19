@@ -69,6 +69,9 @@ void URammsNewtonSolverComponent::DeactivateNewtonSolver()
 	}
 	bLoadInFlight = false;
 	bResyncInFlight = false;
+	// Close the epoch so a bind or seed still in flight cannot finish an
+	// install into the session that replaces this one.
+	InstallGeneration.fetch_add(1);
 	ResyncState = MakeShared<FResyncState, ESPMode::ThreadSafe>();
 	bPendingStepHadMocap = false;
 	AchievedHz.store(0.0f);
@@ -500,6 +503,13 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 	}
 
 	bLoadInFlight = true;
+	// Open a new session epoch here, not at FinishInstall. Everything below is
+	// asynchronous and lands on the game thread minutes later in the worst
+	// case; without a marker taken at the start, a callback from a session
+	// that has since been torn down cannot tell that it is stale, and the
+	// checks it does make (bWantActive, same model) all pass again after a
+	// deactivate/reactivate onto the same model.
+	const uint32 BindGeneration = InstallGeneration.fetch_add(1) + 1;
 	SetStatus(TEXT("Loading model into Newton worker (first load may compile GPU kernels)"));
 
 	// Snapshot everything the background task needs; it must not touch the
@@ -514,7 +524,7 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 
 	Async(EAsyncExecution::ThreadPool,
 		[LocalClient, WeakThis, WeakEngine, Model, ModelNq, ModelNv, ModelNu, ModelTimestep,
-			Xml = MoveTemp(Xml), Assets = MoveTemp(Assets)]() {
+			BindGeneration, Xml = MoveTemp(Xml), Assets = MoveTemp(Assets)]() {
 			const URammsNewtonPhysicsSettings& Settings = URammsNewtonPhysicsSettings::Get();
 			FString							   BindError;
 			FRammsNewtonModelInfo			   Info;
@@ -608,10 +618,19 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 			while (false);
 
 			AsyncTask(ENamedThreads::GameThread,
-				[WeakThis, WeakEngine, Model, Info, BindError, bBound]() {
+				[WeakThis, WeakEngine, Model, Info, BindError, bBound, BindGeneration]() {
 					URammsNewtonSolverComponent* This = WeakThis.Get();
 					if (!This)
 					{
+						return;
+					}
+					if (This->InstallGeneration.load() != BindGeneration)
+					{
+						// A deactivate, or another bind, happened while this
+						// load was out. bLoadInFlight and Client belong to that
+						// newer session now, so touch neither -- clearing the
+						// flag here would let Tick install a handler against a
+						// worker still loading its model.
 						return;
 					}
 					// Deliberately NOT clearing bLoadInFlight here. On the mid-run
@@ -774,12 +793,22 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 		TWeakObjectPtr<URammsNewtonSolverComponent> WeakThis(this);
 		TWeakObjectPtr<UMjPhysicsEngine>			WeakEngine(Engine);
 		mjModel*									Model = Engine->GetModel();
+		// The seed and its fallback reset both finish an install, so they need
+		// the same staleness check the bind does: without it a seed from a
+		// torn-down session installs a handler over the session that replaced
+		// it, having injected state into a client that is no longer the one
+		// the handler will step.
+		const uint32 SeedGeneration = InstallGeneration.load();
 		BeginStateSync(/*bResetWorkerFirst=*/false, Model,
-			[WeakThis, WeakEngine, Model](EStateSyncResult Result, FString Error) {
+			[WeakThis, WeakEngine, Model, SeedGeneration](EStateSyncResult Result, FString Error) {
 				URammsNewtonSolverComponent* This = WeakThis.Get();
 				if (!This || !This->bWantActive)
 				{
 					return;
+				}
+				if (This->InstallGeneration.load() != SeedGeneration)
+				{
+					return; // belongs to a session that is gone
 				}
 				UMjPhysicsEngine* Engine = WeakEngine.Get();
 				if (!Engine || Engine->GetModel() != Model || Result == EStateSyncResult::StaleModel)
@@ -819,30 +848,35 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 					TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> ResetClient = This->Client;
 					TWeakObjectPtr<URammsNewtonSolverComponent>				  WeakSelf(This);
 					TWeakObjectPtr<UMjPhysicsEngine>						  WeakEng(Engine);
-					Async(EAsyncExecution::ThreadPool, [ResetClient, WeakSelf, WeakEng]() {
+					Async(EAsyncExecution::ThreadPool, [ResetClient, WeakSelf, WeakEng, SeedGeneration]() {
 						FString				   ResetError;
 						FRammsNewtonStepResult ResetState;
 						const bool			   bReset =
 							!ResetClient.IsValid() || ResetClient->ResetSim(ResetState, ResetError);
-						AsyncTask(ENamedThreads::GameThread, [WeakSelf, WeakEng, bReset, ResetError]() {
-							URammsNewtonSolverComponent* Self = WeakSelf.Get();
-							UMjPhysicsEngine*			 Eng = WeakEng.Get();
-							if (!Self || !Eng || !Self->bWantActive)
-							{
-								return;
-							}
-							if (!bReset)
-							{
-								Self->SetStatus(FString::Printf(
-									TEXT("Refusing to attach: worker reset failed after a failed seed (%s)"),
-									*ResetError));
-								Self->bWantActive = false;
-								Self->bLoadInFlight = false;
-								return;
-							}
-							Eng->ResetSimulation();
-							Self->FinishInstall(Eng);
-						});
+						AsyncTask(ENamedThreads::GameThread,
+							[WeakSelf, WeakEng, bReset, ResetError, SeedGeneration]() {
+								URammsNewtonSolverComponent* Self = WeakSelf.Get();
+								UMjPhysicsEngine*			 Eng = WeakEng.Get();
+								if (!Self || !Eng || !Self->bWantActive)
+								{
+									return;
+								}
+								if (Self->InstallGeneration.load() != SeedGeneration)
+								{
+									return; // belongs to a session that is gone
+								}
+								if (!bReset)
+								{
+									Self->SetStatus(FString::Printf(
+										TEXT("Refusing to attach: worker reset failed after a failed seed (%s)"),
+										*ResetError));
+									Self->bWantActive = false;
+									Self->bLoadInFlight = false;
+									return;
+								}
+								Eng->ResetSimulation();
+								Self->FinishInstall(Eng);
+							});
 					});
 					return;
 				}
