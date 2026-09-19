@@ -667,7 +667,7 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 						return;
 					}
 					This->ModelInfo = Info;
-					This->InstallHandler(Engine);
+					This->InstallHandler(Engine, Model);
 				});
 		});
 }
@@ -769,19 +769,36 @@ void URammsNewtonSolverComponent::BeginStateSync(bool bResetWorkerFirst,
 		});
 }
 
-void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
+void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine, mjModel_* BoundModel)
 {
 	// The worker sits at the model's initial state after load. If the engine
 	// already advanced (long GPU-kernel compile, mid-run activation), seed
 	// the worker with the engine's CURRENT state via set_state instead of
 	// resetting the whole simulation.
 	double EngineTime = 0.0;
+	bool   bStaleModel = false;
 	{
 		FScopeLock Lock(&Engine->CallbackMutex);
-		if (mjData* Data = Engine->GetData())
+		// Checked under the same lock as the state read, and against the model
+		// the worker actually loaded -- not a fresh GetModel(). The bind did
+		// check the model before calling in, but acquiring this lock can wait,
+		// so re-reading here would adopt whatever URLab has compiled by now and
+		// call it the expected model while the worker still holds the old one.
+		if (Engine->GetModel() != BoundModel)
+		{
+			bStaleModel = true;
+		}
+		else if (mjData* Data = Engine->GetData())
 		{
 			EngineTime = Data->time;
 		}
+	}
+	if (bStaleModel)
+	{
+		// Nothing was installed, so drop the guard and let Tick rebind.
+		bLoadInFlight = false;
+		SetStatus(TEXT("Model changed before install — rebinding"));
+		return;
 	}
 	if (EngineTime > UE_KINDA_SMALL_NUMBER)
 	{
@@ -792,7 +809,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 		BoundEngine = Engine; // BeginStateSync captures from BoundEngine
 		TWeakObjectPtr<URammsNewtonSolverComponent> WeakThis(this);
 		TWeakObjectPtr<UMjPhysicsEngine>			WeakEngine(Engine);
-		mjModel*									Model = Engine->GetModel();
+		mjModel*									Model = BoundModel;
 		// The seed and its fallback reset both finish an install, so they need
 		// the same staleness check the bind does: without it a seed from a
 		// torn-down session installs a handler over the session that replaced
@@ -825,7 +842,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 				}
 				if (Result == EStateSyncResult::Ok)
 				{
-					This->FinishInstall(Engine);
+					This->FinishInstall(Engine, Model);
 					return;
 				}
 				if (This->bResetSimOnActivate)
@@ -889,7 +906,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 									return;
 								}
 								Eng->ResetSimulation();
-								Self->FinishInstall(Eng);
+								Self->FinishInstall(Eng, Model);
 							});
 					});
 					return;
@@ -903,7 +920,7 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 		return;
 	}
 
-	FinishInstall(Engine);
+	FinishInstall(Engine, BoundModel);
 }
 
 void URammsNewtonSolverComponent::RaiseResync(EResyncRequest Kind)
@@ -926,7 +943,7 @@ void URammsNewtonSolverComponent::RaiseResync(EResyncRequest Kind)
 	}
 }
 
-void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
+void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine, mjModel_* BoundModel)
 {
 	// The install is done, so Tick may judge the binding again from here on.
 	bLoadInFlight = false;
@@ -940,7 +957,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 	// unserviced with the handler silently stepping locally forever.
 	bResyncInFlight = false;
 	BoundEngine = Engine;
-	ExpectedModel.store(Engine->GetModel());
+	ExpectedModel.store(BoundModel);
 	bStepFailed.store(false);
 	bForwardMocap.store(true);
 	// A fresh object, not a reset of the old one: see the member's note --

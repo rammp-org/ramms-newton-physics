@@ -117,10 +117,13 @@ protected:
 private:
 	UMjPhysicsEngine* FindEngine() const;
 	void			  BeginBind(UMjPhysicsEngine* Engine);
-	void			  InstallHandler(UMjPhysicsEngine* Engine);
-	void			  FinishInstall(UMjPhysicsEngine* Engine);
-	void			  UninstallHandler();
-	void			  SetStatus(const FString& InStatus);
+	/** Both take the model the worker actually loaded. Re-reading
+	 *  Engine->GetModel() here instead would pick up whatever URLab has
+	 *  compiled by now, which is not necessarily what the worker holds. */
+	void InstallHandler(UMjPhysicsEngine* Engine, mjModel_* BoundModel);
+	void FinishInstall(UMjPhysicsEngine* Engine, mjModel_* BoundModel);
+	void UninstallHandler();
+	void SetStatus(const FString& InStatus);
 
 	/**
 	 * Push the engine's current qpos/qvel/act/time into the worker
