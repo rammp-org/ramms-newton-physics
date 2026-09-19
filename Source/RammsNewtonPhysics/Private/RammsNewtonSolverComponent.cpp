@@ -182,11 +182,21 @@ void URammsNewtonSolverComponent::TickComponent(
 				? TEXT("Sim reset — resetting Newton worker + injecting state")
 				: TEXT("Snapshot restore — injecting state into Newton worker"));
 		TWeakObjectPtr<URammsNewtonSolverComponent> WeakThis(this);
+		const uint32								Generation = InstallGeneration.load();
 		BeginStateSync(bIsReset,
-			[WeakThis, bIsReset](bool bOk, FString Error) {
+			[WeakThis, bIsReset, Generation, Serviced = static_cast<uint8>(Resync)](
+				bool bOk, FString Error) {
 				URammsNewtonSolverComponent* This = WeakThis.Get();
 				if (!This)
 				{
+					return;
+				}
+				if (This->InstallGeneration.load() != Generation)
+				{
+					// The handler was reinstalled while this was in flight, so
+					// this reply describes a session that no longer exists.
+					// Touching PendingResync or LastSteppedTime here would
+					// corrupt the new one.
 					return;
 				}
 				This->bResyncInFlight = false;
@@ -213,7 +223,15 @@ void URammsNewtonSolverComponent::TickComponent(
 						This->LastSteppedTime.store(Data->time);
 					}
 				}
-				This->PendingResync.store(static_cast<uint8>(EResyncRequest::None));
+				// Clear only the request this call actually serviced. A sim
+				// reset raised while a SetState sync was in flight is a
+				// different, stronger request: storing None unconditionally
+				// would drop it, leaving the engine at t=0, the worker mid-run,
+				// and the first writeback snapping the pose back to a stale one
+				// under a status line claiming success.
+				uint8 Expected = Serviced;
+				This->PendingResync.compare_exchange_strong(
+					Expected, static_cast<uint8>(EResyncRequest::None));
 				This->SetStatus(bIsReset
 						? TEXT("Newton stepping active (reset + state resync)")
 						: TEXT("Newton stepping active (snapshot restored via set_state)"));
@@ -776,6 +794,8 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 {
 	// The install is done, so Tick may judge the binding again from here on.
 	bLoadInFlight = false;
+	// Anything still in flight from a previous installation is now stale.
+	InstallGeneration.fetch_add(1);
 	BoundEngine = Engine;
 	ExpectedModel.store(Engine->GetModel());
 	bStepFailed.store(false);

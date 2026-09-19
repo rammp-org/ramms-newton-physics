@@ -167,6 +167,12 @@ private:
 	std::atomic<uint8> PendingResync{ 0 };
 	bool			   bResyncInFlight = false;
 
+	/** Bumped by every install. A resync completion carries the generation it
+	 *  started in and does nothing if that no longer matches, so a reply
+	 *  arriving after a deactivate/reactivate cycle cannot clear a request
+	 *  belonging to the new session or re-arm it against the old model. */
+	std::atomic<uint32> InstallGeneration{ 0 };
+
 	/**
 	 * d->time as of our last writeback (physics thread). -1 = no step yet.
 	 * The handler compares mjData's time against this to detect resets and
