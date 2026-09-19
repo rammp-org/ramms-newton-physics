@@ -848,13 +848,13 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 					TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> ResetClient = This->Client;
 					TWeakObjectPtr<URammsNewtonSolverComponent>				  WeakSelf(This);
 					TWeakObjectPtr<UMjPhysicsEngine>						  WeakEng(Engine);
-					Async(EAsyncExecution::ThreadPool, [ResetClient, WeakSelf, WeakEng, SeedGeneration]() {
+					Async(EAsyncExecution::ThreadPool, [ResetClient, WeakSelf, WeakEng, SeedGeneration, Model]() {
 						FString				   ResetError;
 						FRammsNewtonStepResult ResetState;
 						const bool			   bReset =
 							!ResetClient.IsValid() || ResetClient->ResetSim(ResetState, ResetError);
 						AsyncTask(ENamedThreads::GameThread,
-							[WeakSelf, WeakEng, bReset, ResetError, SeedGeneration]() {
+							[WeakSelf, WeakEng, bReset, ResetError, SeedGeneration, Model]() {
 								URammsNewtonSolverComponent* Self = WeakSelf.Get();
 								UMjPhysicsEngine*			 Eng = WeakEng.Get();
 								if (!Self || !Eng || !Self->bWantActive)
@@ -864,6 +864,20 @@ void URammsNewtonSolverComponent::InstallHandler(UMjPhysicsEngine* Engine)
 								if (Self->InstallGeneration.load() != SeedGeneration)
 								{
 									return; // belongs to a session that is gone
+								}
+								if (Eng->GetModel() != Model)
+								{
+									// The epoch cannot catch this one: bLoadInFlight is held
+									// across the seed, which is what stops Tick from starting
+									// the rebind that would advance it. So a model swap during
+									// the reset -- and a v1 worker reset is budgeted
+									// LoadTimeoutSeconds, so the window is long -- would have
+									// FinishInstall record the new model as expected and
+									// install a handler over a worker still holding the old
+									// one. Drop the guard instead and let Tick rebind.
+									Self->bLoadInFlight = false;
+									Self->SetStatus(TEXT("Model changed during reset fallback — rebinding"));
+									return;
 								}
 								if (!bReset)
 								{
