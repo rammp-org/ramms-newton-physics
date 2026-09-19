@@ -128,7 +128,14 @@ private:
 	 * bResetWorkerFirst mirrors a sim reset with a worker rebuild before the
 	 * injection. OnDone runs on the game thread with the outcome.
 	 */
-	void BeginStateSync(bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone);
+	/**
+	 * @param OnInjectedUnderLock  Runs on the worker thread with the engine's
+	 *        CallbackMutex still held, right after a successful injection, so
+	 *        the caller can retire its request before physics can step again.
+	 *        Must touch nothing that needs the game thread.
+	 */
+	void BeginStateSync(bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone,
+		TFunction<void(double)> OnInjectedUnderLock = nullptr);
 
 	/**
 	 * Validate a worker state (layout + finiteness) and write it into mjData,
@@ -176,8 +183,24 @@ private:
 	 * raises during one RPC, and raises are edge-triggered (one per observed
 	 * discontinuity, not one per step).
 	 */
-	std::atomic<uint32> PendingResync{ 0 };
-	bool				bResyncInFlight = false;
+	/**
+	 * Held by shared ref, not as plain members, because a resync retires from
+	 * the worker thread while it still holds the engine's CallbackMutex (see
+	 * BeginStateSync). Reaching back through the UObject there would mean
+	 * resolving a weak pointer off the game thread; a ref-counted struct the
+	 * in-flight lambda owns a reference to is valid whatever happens to the
+	 * component.
+	 */
+	struct FResyncState
+	{
+		/** Packed kind + occurrence; see PendingResync notes above. */
+		std::atomic<uint32> Pending{ 0 };
+		/** d->time as of our last writeback. -1 = no step yet. */
+		std::atomic<double> LastSteppedTime{ -1.0 };
+	};
+	TSharedRef<FResyncState, ESPMode::ThreadSafe> ResyncState = MakeShared<FResyncState, ESPMode::ThreadSafe>();
+
+	bool bResyncInFlight = false;
 
 	static constexpr uint32 ResyncCountShift = 8;
 
@@ -194,13 +217,6 @@ private:
 	 *  arriving after a deactivate/reactivate cycle cannot clear a request
 	 *  belonging to the new session or re-arm it against the old model. */
 	std::atomic<uint32> InstallGeneration{ 0 };
-
-	/**
-	 * d->time as of our last writeback (physics thread). -1 = no step yet.
-	 * The handler compares mjData's time against this to detect resets and
-	 * restores that happened between our steps.
-	 */
-	std::atomic<double> LastSteppedTime{ -1.0 };
 
 	bool bWantActive = false;
 	bool bHandlerInstalled = false;

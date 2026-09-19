@@ -69,8 +69,8 @@ void URammsNewtonSolverComponent::DeactivateNewtonSolver()
 	}
 	bLoadInFlight = false;
 	bResyncInFlight = false;
-	PendingResync.store(0);
-	LastSteppedTime.store(-1.0);
+	ResyncState->Pending.store(0);
+	ResyncState->LastSteppedTime.store(-1.0);
 	bPendingStepHadMocap = false;
 	AchievedHz.store(0.0f);
 	SetStatus(TEXT("Inactive (URLab stepping locally)"));
@@ -179,7 +179,7 @@ void URammsNewtonSolverComponent::TickComponent(
 	// a worker still holding the old one -- mismatched nq, a rejected RPC, and
 	// the whole backend dropped over what should have been a rebind. A rebind
 	// supersedes any pending request anyway; FinishInstall clears it.
-	const uint32		 PendingSnapshot = PendingResync.load();
+	const uint32		 PendingSnapshot = ResyncState->Pending.load();
 	const EResyncRequest Resync = ResyncKind(PendingSnapshot);
 	if (bHandlerInstalled && Resync != EResyncRequest::None && !bResyncInFlight
 		&& Engine->GetModel() == ExpectedModel.load())
@@ -191,9 +191,10 @@ void URammsNewtonSolverComponent::TickComponent(
 				: TEXT("Snapshot restore — injecting state into Newton worker"));
 		TWeakObjectPtr<URammsNewtonSolverComponent> WeakThis(this);
 		const uint32								Generation = InstallGeneration.load();
-		BeginStateSync(bIsReset,
-			[WeakThis, bIsReset, Generation, Serviced = PendingSnapshot](
-				bool bOk, FString Error) {
+		// Set under the engine's lock by the retire below, read on the game
+		// thread once the reply lands.
+		TSharedRef<std::atomic<bool>, ESPMode::ThreadSafe> Retired = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
+		BeginStateSync(bIsReset, [WeakThis, bIsReset, Generation, Retired](bool bOk, FString Error) {
 				URammsNewtonSolverComponent* This = WeakThis.Get();
 				if (!This)
 				{
@@ -220,42 +221,51 @@ void URammsNewtonSolverComponent::TickComponent(
 					This->bStepFailed.store(true); // next Tick falls back cleanly
 					return;
 				}
-				// Re-arm the handler at the engine's current time so the
-				// discontinuity check doesn't re-trigger on the local steps
-				// taken while the worker was syncing.
-				if (UMjPhysicsEngine* BoundEnginePtr = This->BoundEngine.Get())
+				// The request was retired under the engine's lock, back when
+				// the state was injected -- not here. See BeginStateSync: by
+				// the time this reply reaches the game thread the physics
+				// thread has been free to run for a whole hop, and any step it
+				// took in that window would be stranded on the engine side.
+				if (!Retired->load())
 				{
-					FScopeLock Lock(&BoundEnginePtr->CallbackMutex);
-					if (mjData* Data = BoundEnginePtr->GetData())
-					{
-						This->LastSteppedTime.store(Data->time);
-					}
-				}
-				// Clear only the exact request this call serviced -- same kind
-				// AND same occurrence. Anything raised while the RPC was out
-				// (a reset landing mid-restore, or a second reset) survives,
-				// and the next Tick services it. Storing None unconditionally
-				// would drop it, leaving the engine at t=0, the worker mid-run,
-				// and the first writeback snapping the pose back to a stale one
-				// under a status line claiming success.
-				uint32	   Expected = Serviced;
-				const bool bStillCurrent = This->PendingResync.compare_exchange_strong(Expected, 0);
-				if (!bStillCurrent)
-				{
-					// Say so rather than reporting the success of a sync that
-					// has already been overtaken.
+					// A newer request landed before the injection retired this
+					// one. Say so rather than reporting the success of a sync
+					// that has already been overtaken.
 					This->SetStatus(TEXT("Resync superseded by a newer request — re-syncing"));
 					return;
 				}
 				This->SetStatus(bIsReset
 						? TEXT("Newton stepping active (reset + state resync)")
-						: TEXT("Newton stepping active (snapshot restored via set_state)"));
-			});
+						: TEXT("Newton stepping active (snapshot restored via set_state)")); },
+			// Runs on the worker thread with the engine's CallbackMutex still
+			// held, immediately after the state lands in the worker. Touches
+			// only the shared resync state, never the component, so it needs
+			// no weak-pointer resolve off the game thread.
+			[State = ResyncState, Serviced = PendingSnapshot, Retired](double InjectedTime) {
+				// Clear the exact request serviced -- same kind AND same
+				// occurrence -- so anything raised while the RPC was out
+				// survives for the next Tick to service.
+				uint32 Expected = Serviced;
+				if (State->Pending.compare_exchange_strong(Expected, 0))
+				{
+					// The engine cannot have stepped since the injection, so
+					// this baseline matches what the worker now holds.
+					State->LastSteppedTime.store(InjectedTime);
+					Retired->store(true);
+				} });
 		return;
 	}
 
 	// (Re)bind whenever URLab's compiled model is not the one the worker mirrors.
-	if (Engine->GetModel() != ExpectedModel.load() && !bLoadInFlight)
+	// Not while a resync is still out, though: the generation check on its
+	// completion only suppresses the reply, it cannot recall the RPCs. The
+	// client is shared across installs and takes its request mutex per call,
+	// so load_model would be free to interleave between that sync's reset and
+	// its set_state -- injecting the old model's state into the newly loaded
+	// worker. Deferring costs a tick; the sync completes in milliseconds, and
+	// a dead worker clears the flag through the failure path rather than
+	// pinning it.
+	if (Engine->GetModel() != ExpectedModel.load() && !bLoadInFlight && !bResyncInFlight)
 	{
 		if (bHandlerInstalled)
 		{
@@ -635,7 +645,8 @@ void URammsNewtonSolverComponent::BeginBind(UMjPhysicsEngine* Engine)
 }
 
 void URammsNewtonSolverComponent::BeginStateSync(
-	bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone)
+	bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone,
+	TFunction<void(double)> OnInjectedUnderLock)
 {
 	TSharedPtr<FRammsNewtonWorkerClient, ESPMode::ThreadSafe> LocalClient = Client;
 	TWeakObjectPtr<UMjPhysicsEngine>						  WeakEngine = BoundEngine;
@@ -645,7 +656,7 @@ void URammsNewtonSolverComponent::BeginStateSync(
 		return;
 	}
 	Async(EAsyncExecution::ThreadPool,
-		[LocalClient, WeakEngine, OnDone, bResetWorkerFirst]() {
+		[LocalClient, WeakEngine, OnDone, OnInjectedUnderLock, bResetWorkerFirst]() {
 			FRammsNewtonStepResult Unused;
 			FString				   Error;
 			bool				   bOk = true;
@@ -690,6 +701,17 @@ void URammsNewtonSolverComponent::BeginStateSync(
 						}
 						Time = Data->time;
 						bOk = LocalClient->SetState(Qpos, Qvel, Act, Time, Unused, Error);
+						if (bOk && OnInjectedUnderLock)
+						{
+							// Still under CallbackMutex. Retiring the request
+							// out on the game thread instead would leave a
+							// whole hop in which the handler still sees the
+							// request pending, steps locally, and strands those
+							// steps: the worker is at the state we just
+							// injected, so its next writeback rolls the engine
+							// back over them.
+							OnInjectedUnderLock(Time);
+						}
 					}
 				}
 				if (Time < 0.0)
@@ -809,7 +831,7 @@ void URammsNewtonSolverComponent::RaiseResync(EResyncRequest Kind)
 {
 	// Physics thread. Lock-free because the step handler runs under the
 	// engine's CallbackMutex and must not take another lock behind it.
-	uint32 Cur = PendingResync.load();
+	uint32 Cur = ResyncState->Pending.load();
 	for (;;)
 	{
 		// Reset subsumes SetState -- it rebuilds the worker's model and then
@@ -818,7 +840,7 @@ void URammsNewtonSolverComponent::RaiseResync(EResyncRequest Kind)
 		// thrown away.
 		const EResyncRequest Wanted = ResyncKind(Cur) == EResyncRequest::Reset ? EResyncRequest::Reset : Kind;
 		const uint32		 Next = (((Cur >> ResyncCountShift) + 1) << ResyncCountShift) | static_cast<uint32>(Wanted);
-		if (PendingResync.compare_exchange_weak(Cur, Next))
+		if (ResyncState->Pending.compare_exchange_weak(Cur, Next))
 		{
 			return;
 		}
@@ -842,8 +864,8 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 	ExpectedModel.store(Engine->GetModel());
 	bStepFailed.store(false);
 	bForwardMocap.store(true);
-	PendingResync.store(0);
-	LastSteppedTime.store(-1.0);
+	ResyncState->Pending.store(0);
+	ResyncState->LastSteppedTime.store(-1.0);
 	bPipelineActive = URammsNewtonPhysicsSettings::Get().bPipelineSteps;
 	bPendingStepHadMocap = false;
 	StepCounter.store(0);
@@ -913,7 +935,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 			// iteration before the handler runs, so mjData is already in the
 			// new state here. Any pipelined request still in flight is drained
 			// (and discarded) by the resync RPC itself.
-			const double Prev = LastSteppedTime.load();
+			const double Prev = ResyncState->LastSteppedTime.load();
 			if (Prev >= 0.0 && !FMath::IsNearlyEqual(Data->time, Prev, Model->opt.timestep * 0.5))
 			{
 				RaiseResync(Data->time < Model->opt.timestep * 0.5 ? EResyncRequest::Reset
@@ -945,14 +967,14 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 			}
 
 			if (Model != ExpectedModel.load() || bStepFailed.load() || !Client.IsValid()
-				|| ResyncKind(PendingResync.load()) != EResyncRequest::None)
+				|| ResyncKind(ResyncState->Pending.load()) != EResyncRequest::None)
 			{
 				mj_step(Model, Data);
 				// Every local step has to move the baseline, or servicing a
 				// resync leaves a trail of "unexplained" time jumps behind it
 				// and the next call reads our own step as a fresh external
 				// jump -- a self-sustaining loop.
-				LastSteppedTime.store(Data->time);
+				ResyncState->LastSteppedTime.store(Data->time);
 				return Advanced();
 			}
 
@@ -978,7 +1000,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 						// the next reply pairs a stale pose with a newer time.
 						RaiseResync(EResyncRequest::SetState);
 						mj_step(Model, Data);
-						LastSteppedTime.store(Data->time);
+						ResyncState->LastSteppedTime.store(Data->time);
 						return Advanced();
 					}
 					SetStatus(FString::Printf(TEXT("Step failed: %s"), *Error));
@@ -1028,7 +1050,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 					// next writeback fully overwrites qpos/qvel/act anyway.
 					mj_step(Model, Data);
 				}
-				LastSteppedTime.store(Data->time);
+				ResyncState->LastSteppedTime.store(Data->time);
 				StepCounter.fetch_add(1);
 				return Advanced();
 			}
@@ -1048,7 +1070,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 					// step behind. Push state before resuming.
 					RaiseResync(EResyncRequest::SetState);
 					mj_step(Model, Data);
-					LastSteppedTime.store(Data->time);
+					ResyncState->LastSteppedTime.store(Data->time);
 					return Advanced();
 				}
 				SetStatus(FString::Printf(TEXT("Step failed: %s"), *Error));
@@ -1061,7 +1083,7 @@ void URammsNewtonSolverComponent::FinishInstall(UMjPhysicsEngine* Engine)
 				mj_step(Model, Data);
 				return Advanced();
 			}
-			LastSteppedTime.store(Data->time);
+			ResyncState->LastSteppedTime.store(Data->time);
 			StepCounter.fetch_add(1);
 			return Advanced();
 		});
@@ -1121,7 +1143,7 @@ bool URammsNewtonSolverComponent::ValidateAndWriteback(
 		FMemory::Memcpy(Data->act, Result.Act.GetData(), Model->na * sizeof(double));
 	}
 	Data->time += Model->opt.timestep;
-	LastSteppedTime.store(Data->time);
+	ResyncState->LastSteppedTime.store(Data->time);
 
 	// Recompute all derived quantities (sites, sensors, contacts) at
 	// Newton's state so URLab's sensors/publishers stay consistent.
