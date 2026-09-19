@@ -134,8 +134,19 @@ private:
 	 *        the caller can retire its request before physics can step again.
 	 *        Must touch nothing that needs the game thread.
 	 */
-	void BeginStateSync(bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone,
-		TFunction<void(double)> OnInjectedUnderLock = nullptr);
+	/** Outcome of a BeginStateSync. StaleModel is not a failure: the compiled
+	 *  model moved under the sync, so the right answer is to rebind, not to
+	 *  drop the backend. */
+	enum class EStateSyncResult : uint8
+	{
+		Ok,
+		Failed,
+		StaleModel,
+	};
+
+	void BeginStateSync(bool bResetWorkerFirst, const mjModel_* ExpectedModelForSync,
+		TFunction<void(EStateSyncResult, FString)> OnDone,
+		TFunction<void(double)>					   OnInjectedUnderLock = nullptr);
 
 	/**
 	 * Validate a worker state (layout + finiteness) and write it into mjData,
@@ -198,6 +209,15 @@ private:
 		/** d->time as of our last writeback. -1 = no step yet. */
 		std::atomic<double> LastSteppedTime{ -1.0 };
 	};
+	/**
+	 * Replaced -- not cleared -- by every install. A retire from a previous
+	 * installation still holds a reference to the old object, and clearing in
+	 * place would restart the occurrence counter at zero, letting that stale
+	 * retire's ticket collide with the new session's first request and clear
+	 * it unserviced. Safe to swap because the handler is installed at the end
+	 * of FinishInstall and the previous one was removed by UninstallHandler
+	 * under CallbackMutex, so nothing is reading it.
+	 */
 	TSharedRef<FResyncState, ESPMode::ThreadSafe> ResyncState = MakeShared<FResyncState, ESPMode::ThreadSafe>();
 
 	bool bResyncInFlight = false;
