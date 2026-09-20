@@ -117,10 +117,13 @@ protected:
 private:
 	UMjPhysicsEngine* FindEngine() const;
 	void			  BeginBind(UMjPhysicsEngine* Engine);
-	void			  InstallHandler(UMjPhysicsEngine* Engine);
-	void			  FinishInstall(UMjPhysicsEngine* Engine);
-	void			  UninstallHandler();
-	void			  SetStatus(const FString& InStatus);
+	/** Both take the model the worker actually loaded. Re-reading
+	 *  Engine->GetModel() here instead would pick up whatever URLab has
+	 *  compiled by now, which is not necessarily what the worker holds. */
+	void InstallHandler(UMjPhysicsEngine* Engine, mjModel_* BoundModel);
+	void FinishInstall(UMjPhysicsEngine* Engine, mjModel_* BoundModel);
+	void UninstallHandler();
+	void SetStatus(const FString& InStatus);
 
 	/**
 	 * Push the engine's current qpos/qvel/act/time into the worker
@@ -128,7 +131,25 @@ private:
 	 * bResetWorkerFirst mirrors a sim reset with a worker rebuild before the
 	 * injection. OnDone runs on the game thread with the outcome.
 	 */
-	void BeginStateSync(bool bResetWorkerFirst, TFunction<void(bool, FString)> OnDone);
+	/**
+	 * @param OnInjectedUnderLock  Runs on the worker thread with the engine's
+	 *        CallbackMutex still held, right after a successful injection, so
+	 *        the caller can retire its request before physics can step again.
+	 *        Must touch nothing that needs the game thread.
+	 */
+	/** Outcome of a BeginStateSync. StaleModel is not a failure: the compiled
+	 *  model moved under the sync, so the right answer is to rebind, not to
+	 *  drop the backend. */
+	enum class EStateSyncResult : uint8
+	{
+		Ok,
+		Failed,
+		StaleModel,
+	};
+
+	void BeginStateSync(bool bResetWorkerFirst, const mjModel_* ExpectedModelForSync,
+		TFunction<void(EStateSyncResult, FString)> OnDone,
+		TFunction<void(double)>					   OnInjectedUnderLock = nullptr);
 
 	/**
 	 * Validate a worker state (layout + finiteness) and write it into mjData,
@@ -164,15 +185,61 @@ private:
 		/** d->time jumped mid-run (snapshot restore) — worker set_state injection. */
 		SetState = 2,
 	};
-	std::atomic<uint8> PendingResync{ 0 };
-	bool			   bResyncInFlight = false;
-
 	/**
-	 * d->time as of our last writeback (physics thread). -1 = no step yet.
-	 * The handler compares mjData's time against this to detect resets and
-	 * restores that happened between our steps.
+	 * Packed request: low 8 bits an EResyncRequest, high 24 a counter bumped by
+	 * every raise. The kind alone cannot tell "still the request I am
+	 * servicing" from "a fresh one of the same kind arrived while I was gone",
+	 * and the completion clears by compare-exchange -- so without the counter a
+	 * second reset raised mid-RPC would be cleared unserviced, and the next
+	 * writeback would push the pre-reset pose back into the engine.
+	 *
+	 * The counter wraps at 2^24; a collision needs exactly 16.7M intervening
+	 * raises during one RPC, and raises are edge-triggered (one per observed
+	 * discontinuity, not one per step).
 	 */
-	std::atomic<double> LastSteppedTime{ -1.0 };
+	/**
+	 * Held by shared ref, not as plain members, because a resync retires from
+	 * the worker thread while it still holds the engine's CallbackMutex (see
+	 * BeginStateSync). Reaching back through the UObject there would mean
+	 * resolving a weak pointer off the game thread; a ref-counted struct the
+	 * in-flight lambda owns a reference to is valid whatever happens to the
+	 * component.
+	 */
+	struct FResyncState
+	{
+		/** Packed kind + occurrence; see PendingResync notes above. */
+		std::atomic<uint32> Pending{ 0 };
+		/** d->time as of our last writeback. -1 = no step yet. */
+		std::atomic<double> LastSteppedTime{ -1.0 };
+	};
+	/**
+	 * Replaced -- not cleared -- by every install. A retire from a previous
+	 * installation still holds a reference to the old object, and clearing in
+	 * place would restart the occurrence counter at zero, letting that stale
+	 * retire's ticket collide with the new session's first request and clear
+	 * it unserviced. Safe to swap because the handler is installed at the end
+	 * of FinishInstall and the previous one was removed by UninstallHandler
+	 * under CallbackMutex, so nothing is reading it.
+	 */
+	TSharedRef<FResyncState, ESPMode::ThreadSafe> ResyncState = MakeShared<FResyncState, ESPMode::ThreadSafe>();
+
+	bool bResyncInFlight = false;
+
+	static constexpr uint32 ResyncCountShift = 8;
+
+	static EResyncRequest ResyncKind(uint32 Packed)
+	{
+		return static_cast<EResyncRequest>(Packed & 0xFFu);
+	}
+
+	/** Raise a resync from the step handler, never weakening a pending Reset. */
+	void RaiseResync(EResyncRequest Kind);
+
+	/** Bumped by every install. A resync completion carries the generation it
+	 *  started in and does nothing if that no longer matches, so a reply
+	 *  arriving after a deactivate/reactivate cycle cannot clear a request
+	 *  belonging to the new session or re-arm it against the old model. */
+	std::atomic<uint32> InstallGeneration{ 0 };
 
 	bool bWantActive = false;
 	bool bHandlerInstalled = false;
